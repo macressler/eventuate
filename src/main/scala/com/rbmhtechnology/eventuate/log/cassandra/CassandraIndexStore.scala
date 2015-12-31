@@ -72,7 +72,7 @@ private[eventuate] class CassandraIndexStore(cassandra: Cassandra, logId: String
     final def hasNext: Boolean = {
       if (currentIter.hasNext) {
         true
-      } else if (rowCount < cassandra.settings.partitionSizeMax) {
+      } else if (rowCount < cassandra.settings.partitionSize) {
         // all events consumed
         false
       } else {

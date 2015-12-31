@@ -244,7 +244,7 @@ During execution of disaster recovery, directly connected endpoints must be avai
 
 Disaster recovery also deletes invalid snapshots, in case they survived the disaster. Invalid snapshots are those that cover lost events.
 
-A complete reference of ``eventuate.disaster-recovery.*`` configuration options is given in section :ref:`configuration`. The example application also implements :ref:`example-disaster-recovery`.
+A complete reference of ``eventuate.log.recovery.*`` configuration options is given in section :ref:`configuration`. The example application also implements :ref:`example-disaster-recovery`.
 
 .. note::
    Installing a storage backup is a separate administrative task that is not covered by running ``recover()``.

@@ -43,7 +43,7 @@ object EventsourcedProcessorSpec {
     override val id = emitterIdB
     override val eventLog = srcProbe
     override val targetEventLog = trgProbe
-    override val replayChunkSizeMax = 2
+    override val replayBatchSize = 2
 
     override def onCommand = {
       case cmd => appProbe ! cmd

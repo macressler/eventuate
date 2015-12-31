@@ -35,7 +35,7 @@ object EventsourcedWriterSpec {
 
     override val id = emitterIdB
     override val eventLog = logProbe
-    override val replayChunkSizeMax: Int = 2
+    override val replayBatchSize: Int = 2
 
     override def onCommand = {
       case cmd => appProbe ! cmd

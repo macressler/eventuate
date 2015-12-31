@@ -48,8 +48,8 @@ class LeveldbEventLogSettings(config: Config) extends EventLogSettings {
   val stateSnapshotLimit: Int =
     config.getInt("eventuate.log.leveldb.state-snapshot-limit")
 
-  val deletionBatchSizeMax: Int =
-    config.getInt("eventuate.log.leveldb.deletion-batch-size-max")
+  val deletionBatchSize: Int =
+    config.getInt("eventuate.log.leveldb.deletion-batch-size")
 
   val initRetryDelay: FiniteDuration =
     Duration.Zero
@@ -60,7 +60,7 @@ class LeveldbEventLogSettings(config: Config) extends EventLogSettings {
   val deletionRetryDelay: FiniteDuration =
     config.getDuration("eventuate.log.leveldb.deletion-retry-delay", TimeUnit.MILLISECONDS).millis
 
-  val partitionSizeMax: Long =
+  val partitionSize: Long =
     Long.MaxValue
 }
 
@@ -82,11 +82,11 @@ class LeveldbEventLog(id: String, prefix: String) extends EventLog[LeveldbEventI
   override val settings = new LeveldbEventLogSettings(context.system.settings.config)
   private val serialization = SerializationExtension(context.system)
 
+  private val leveldbDir = new File(settings.rootDir, s"${prefix}-${id}"); leveldbDir.mkdirs()
   private val leveldbOptions = new Options().createIfMissing(true)
-  protected val leveldbWriteOptions = new WriteOptions().sync(settings.fsync).snapshot(false)
   private def leveldbReadOptions = new ReadOptions().verifyChecksums(false)
 
-  private val leveldbDir = new File(settings.rootDir, s"${prefix}-${id}"); leveldbDir.mkdirs()
+  protected val leveldbWriteOptions = new WriteOptions().sync(settings.fsync).snapshot(false)
   protected val leveldb = factory.open(leveldbDir, leveldbOptions)
 
   private val aggregateIdMap = new LeveldbNumericIdentifierStore(leveldb, -1)
@@ -145,14 +145,14 @@ class LeveldbEventLog(id: String, prefix: String) extends EventLog[LeveldbEventI
   override def writeDeletionMetadata(deleteMetadata: DeletionMetadata) =
     deletionMetadataStore.writeDeletionMetadata(deleteMetadata)
 
-  override def deleteAsync(sequenceNr: Long): Future[Unit] = {
+  override def delete(toSequenceNr: Long): Future[Unit] = {
     val promise = Promise[Unit]()
-    spawnDeletionActor(sequenceNr, promise)
+    spawnDeletionActor(toSequenceNr, promise)
     promise.future
   }
 
-  private def spawnDeletionActor(sequenceNr: Long, promise: Promise[Unit]): ActorRef =
-    context.actorOf(LeveldbDeletionActor.props(leveldb, leveldbReadOptions, leveldbWriteOptions, settings.deletionBatchSizeMax, sequenceNr, promise))
+  private def spawnDeletionActor(toSequenceNr: Long, promise: Promise[Unit]): ActorRef =
+    context.actorOf(LeveldbDeletionActor.props(leveldb, leveldbReadOptions, leveldbWriteOptions, settings.deletionBatchSize, toSequenceNr, promise))
 
   private def readSync(fromSequenceNr: Long, toSequenceNr: Long, max: Int, filter: DurableEvent => Boolean): BatchReadResult = {
     val first = 1L max fromSequenceNr

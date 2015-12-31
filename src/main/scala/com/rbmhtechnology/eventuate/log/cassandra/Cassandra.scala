@@ -143,12 +143,12 @@ class Cassandra(val system: ExtendedActorSystem) extends Extension { extension =
   @annotation.tailrec
   private def connect(retries: Int = 0): Session = {
     val curAttempt = retries + 1
-    val maxAttempts = settings.initialConnectRetryMax + 1
+    val maxAttempts = settings.connectRetryMax + 1
 
     Try(clusterBuilder.build().connect()) match {
-      case Failure(e: NoHostAvailableException) if retries < settings.initialConnectRetryMax =>
+      case Failure(e: NoHostAvailableException) if retries < settings.connectRetryMax =>
         logging.error(e, s"Cannot connect to cluster (attempt ${curAttempt}/${maxAttempts} ...)")
-        Thread.sleep(settings.initialConnectRetryDelay.toMillis)
+        Thread.sleep(settings.connectRetryDelay.toMillis)
         connect(retries + 1)
       case Failure(e) =>
         logging.error(e, s"Cannot connect to cluster (attempt ${curAttempt}/${maxAttempts} ...)")

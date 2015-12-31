@@ -32,21 +32,21 @@ object EventsourcingProtocol {
   case object WriteNComplete
 
   /**
-   * Instructs an event log to write the given `events` and send the written events one-by-one
-   * to the given `requestor`. In case of a successful write, events are sent within [[WriteSuccess]]
-   * messages, otherwise within [[WriteFailure]] messages with `initiator` as message sender.
+   * Instructs an event log to write the given `events`.
    */
-  case class Write(events: Seq[DurableEvent], initiator: ActorRef, requestor: ActorRef, instanceId: Int) extends DurableEventBatch
+  case class Write(events: Seq[DurableEvent], initiator: ActorRef, replyTo: ActorRef, correlationId: Int, instanceId: Int) extends UpdateableEventBatch[Write] {
+    override def update(events: Seq[DurableEvent]): Write = copy(events = events)
+  }
 
   /**
    * Success reply after a [[Write]].
    */
-  case class WriteSuccess(event: DurableEvent, instanceId: Int)
+  case class WriteSuccess(events: Seq[DurableEvent], correlationId: Int, instanceId: Int)
 
   /**
    * Failure reply after a [[Write]].
    */
-  case class WriteFailure(event: DurableEvent, cause: Throwable, instanceId: Int)
+  case class WriteFailure(events: Seq[DurableEvent], cause: Throwable, correlationId: Int, instanceId: Int)
 
   /**
    * Sent by an event log to all registered participants, if `event` has been successfully written.
@@ -55,26 +55,26 @@ object EventsourcingProtocol {
   case class Written(event: DurableEvent)
 
   object Replay {
-    def apply(from: Long, max: Int, requestor: ActorRef, instanceId: Int): Replay =
-      new Replay(from, max, requestor, None, instanceId)
+    def apply(from: Long, max: Int, replyTo: ActorRef, instanceId: Int): Replay =
+      new Replay(from, max, replyTo, None, instanceId)
 
-    def apply(from: Long, requestor: ActorRef, aggregateId: Option[String], instanceId: Int): Replay =
-      new Replay(from, 65536, requestor, aggregateId, instanceId)
+    def apply(from: Long, replyTo: ActorRef, aggregateId: Option[String], instanceId: Int): Replay =
+      new Replay(from, 65536, replyTo, aggregateId, instanceId)
 
-    def apply(from: Long, requestor: ActorRef, instanceId: Int): Replay =
-      new Replay(from, 65536, requestor, None, instanceId)
+    def apply(from: Long, replyTo: ActorRef, instanceId: Int): Replay =
+      new Replay(from, 65536, replyTo, None, instanceId)
   }
 
   /**
-   * Instructs an event log to replay events from sequence number `from` to the given `requestor`.
-   * Replayed events are sent within [[Replaying]] messages. If replay successfully completes the
-   * event log must additionally send a [[ReplaySuccess]] message, otherwise, a [[ReplayFailure]]
-   * message.
+   * Instructs an event log to replay events from sequence number `from` to the given `replyTo`
+   * destination. Replayed events are sent within [[Replaying]] messages. If replay successfully
+   * completes the event log must additionally send a [[ReplaySuccess]] message, otherwise, a
+   * [[ReplayFailure]] message.
    *
    * If `aggregateId` is defined, only events with a matching `aggregateId` are replayed, otherwise,
    * all events.
    */
-  case class Replay(from: Long, max: Int, requestor: ActorRef, aggregateId: Option[String], instanceId: Int)
+  case class Replay(from: Long, max: Int, replyTo: ActorRef, aggregateId: Option[String], instanceId: Int)
 
   /**
    * Instructs and event log to continue replay with at most `max` events.
@@ -127,7 +127,7 @@ object EventsourcingProtocol {
   /**
    * Instructs an event log to save the given `snapshot`.
    */
-  case class SaveSnapshot(snapshot: Snapshot, initiator: ActorRef, requestor: ActorRef, instanceId: Int)
+  case class SaveSnapshot(snapshot: Snapshot, initiator: ActorRef, replyTo: ActorRef, instanceId: Int)
 
   /**
    * Success reply after a [[SaveSnapshot]].
@@ -140,9 +140,9 @@ object EventsourcingProtocol {
   case class SaveSnapshotFailure(metadata: SnapshotMetadata, cause: Throwable, instanceId: Int)
 
   /**
-   * Instructs an event log to load the most recent snapshot for `requestor` identified by `emitterId`.
+   * Instructs an event log to load the most recent snapshot for `emitterId`.
    */
-  case class LoadSnapshot(emitterId: String, requestor: ActorRef, instanceId: Int)
+  case class LoadSnapshot(emitterId: String, replyTo: ActorRef, instanceId: Int)
 
   /**
    * Success reply after a [[LoadSnapshot]].

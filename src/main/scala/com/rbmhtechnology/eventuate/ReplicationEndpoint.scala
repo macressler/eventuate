@@ -24,6 +24,7 @@ import akka.actor._
 import akka.pattern.ask
 import akka.pattern.pipe
 import akka.util.Timeout
+
 import com.rbmhtechnology.eventuate.EventsourcingProtocol.Delete
 import com.rbmhtechnology.eventuate.EventsourcingProtocol.DeleteFailure
 import com.rbmhtechnology.eventuate.EventsourcingProtocol.DeleteSuccess
@@ -40,17 +41,17 @@ import scala.concurrent.duration._
 import ReplicationProtocol._
 
 class ReplicationSettings(config: Config) {
+  val writeBatchSize: Int =
+    config.getInt("eventuate.log.write-batch-size")
+
+  val writeTimeout: FiniteDuration =
+    config.getDuration("eventuate.log.write-timeout", TimeUnit.MILLISECONDS).millis
+
   val retryDelay: FiniteDuration =
     config.getDuration("eventuate.log.replication.retry-delay", TimeUnit.MILLISECONDS).millis
 
-  val readTimeout: FiniteDuration =
-    config.getDuration("eventuate.log.replication.read-timeout", TimeUnit.MILLISECONDS).millis
-
-  val writeTimeout: FiniteDuration =
-    config.getDuration("eventuate.log.replication.write-timeout", TimeUnit.MILLISECONDS).millis
-
-  val batchSizeMax: Int =
-    config.getInt("eventuate.log.replication.batch-size-max")
+  val remoteReadTimeout: FiniteDuration =
+    config.getDuration("eventuate.log.replication.remote-read-timeout", TimeUnit.MILLISECONDS).millis
 
   val failureDetectionLimit =
     config.getDuration("eventuate.log.replication.failure-detection-limit", TimeUnit.MILLISECONDS).millis
@@ -443,7 +444,7 @@ private class Replicator(target: ReplicationTarget, source: ReplicationSource, f
     readSchedule = Some(scheduler.scheduleOnce(settings.retryDelay, self, ReplicationDue))
 
   private def fetch(): Unit = {
-    implicit val timeout = Timeout(settings.readTimeout)
+    implicit val timeout = Timeout(settings.remoteReadTimeout)
 
     target.log ? GetReplicationProgress(source.logId) recover {
       case t => GetReplicationProgressFailure(t)
@@ -451,11 +452,11 @@ private class Replicator(target: ReplicationTarget, source: ReplicationSource, f
   }
 
   private def read(storedReplicationProgress: Long, currentTargetVersionVector: VectorTime): Unit = {
-    implicit val timeout = Timeout(settings.readTimeout)
+    implicit val timeout = Timeout(settings.remoteReadTimeout)
 
-    (source.acceptor ? ReplicationReadEnvelope(ReplicationRead(storedReplicationProgress + 1, settings.batchSizeMax, filter, target.logId, self, currentTargetVersionVector), source.logName))
-      .recover { case t => ReplicationReadFailure(t.getMessage, target.logId) }
-      .pipeTo(self)
+    (source.acceptor ? ReplicationReadEnvelope(ReplicationRead(storedReplicationProgress + 1, settings.writeBatchSize, filter, target.logId, self, currentTargetVersionVector), source.logName)) recover {
+      case t => ReplicationReadFailure(t.getMessage, target.logId)
+    } pipeTo self
   }
 
   private def write(events: Seq[DurableEvent], replicationProgress: Long, currentSourceVersionVector: VectorTime): Unit = {

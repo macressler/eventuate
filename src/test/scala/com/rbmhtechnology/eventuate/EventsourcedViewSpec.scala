@@ -33,25 +33,55 @@ object EventsourcedViewSpec {
 
   class TestEventsourcedView(
     val logProbe: ActorRef,
-    val dstProbe: ActorRef,
-    customReplayChunkSize: Option[Int]) extends EventsourcedView {
+    val msgProbe: ActorRef,
+    customReplayBatchSize: Option[Int]) extends EventsourcedView {
 
     val id = emitterIdA
     val eventLog = logProbe
 
-    override def replayChunkSizeMax: Int = customReplayChunkSize match {
+    override def replayBatchSize: Int = customReplayBatchSize match {
       case Some(i) => i
-      case None    => super.replayChunkSizeMax
+      case None    => super.replayBatchSize
     }
 
     override def onCommand = {
       case "boom"  => throw boom
-      case Ping(i) => dstProbe ! Pong(i)
+      case Ping(i) => msgProbe ! Pong(i)
     }
 
     override def onEvent = {
       case "boom" => throw boom
-      case evt    => dstProbe ! ((evt, lastVectorTimestamp, lastSequenceNr))
+      case evt    => msgProbe ! ((evt, lastVectorTimestamp, lastSequenceNr))
+    }
+  }
+
+  class TestStashingView(
+    val logProbe: ActorRef,
+    val msgProbe: ActorRef) extends EventsourcedView {
+
+    val id = emitterIdA
+    val eventLog = logProbe
+
+    var stashing = false
+
+    override def onCommand = {
+      case "boom" =>
+        throw boom
+      case "stash-on" =>
+        stashing = true
+      case "stash-off" =>
+        stashing = false
+      case "unstash" =>
+        unstashAll()
+      case Ping(i) if stashing =>
+        stash()
+      case Ping(i) =>
+        msgProbe ! Pong(i)
+    }
+
+    override def onEvent = {
+      case "unstash" =>
+        unstashAll()
     }
   }
 
@@ -81,22 +111,33 @@ class EventsourcedViewSpec extends TestKit(ActorSystem("test")) with WordSpecLik
 
   var instanceId: Int = _
   var logProbe: TestProbe = _
-  var dstProbe: TestProbe = _
+  var msgProbe: TestProbe = _
 
   override def beforeEach(): Unit = {
     instanceId = EventsourcedView.instanceIdCounter.get
     logProbe = TestProbe()
-    dstProbe = TestProbe()
+    msgProbe = TestProbe()
   }
 
   override def afterAll(): Unit =
     TestKit.shutdownActorSystem(system)
 
   def unrecoveredEventsourcedView(): ActorRef =
-    system.actorOf(Props(new TestEventsourcedView(logProbe.ref, dstProbe.ref, None)))
+    system.actorOf(Props(new TestEventsourcedView(logProbe.ref, msgProbe.ref, None)))
 
-  def unrecoveredEventsourcedView(customReplayChunkSize: Int): ActorRef =
-    system.actorOf(Props(new TestEventsourcedView(logProbe.ref, dstProbe.ref, Some(customReplayChunkSize))))
+  def unrecoveredEventsourcedView(customReplayBatchSize: Int): ActorRef =
+    system.actorOf(Props(new TestEventsourcedView(logProbe.ref, msgProbe.ref, Some(customReplayBatchSize))))
+
+  def recoveredStashingView(): ActorRef =
+    processRecover(system.actorOf(Props(new TestStashingView(logProbe.ref, msgProbe.ref))))
+
+  def processRecover(actor: ActorRef, instanceId: Int = instanceId): ActorRef = {
+    logProbe.expectMsg(LoadSnapshot(emitterIdA, actor, instanceId))
+    actor ! LoadSnapshotSuccess(None, instanceId)
+    logProbe.expectMsg(Replay(1, actor, instanceId))
+    actor ! ReplaySuccess(instanceId)
+    actor
+  }
 
   "An EventsourcedView" must {
     "recover from replayed events" in {
@@ -110,10 +151,10 @@ class EventsourcedViewSpec extends TestKit(ActorSystem("test")) with WordSpecLik
       actor ! Replaying(event1b, instanceId)
       actor ! ReplaySuccess(instanceId)
 
-      dstProbe.expectMsg(("a", event1a.vectorTimestamp, event1a.localSequenceNr))
-      dstProbe.expectMsg(("b", event1b.vectorTimestamp, event1b.localSequenceNr))
+      msgProbe.expectMsg(("a", event1a.vectorTimestamp, event1a.localSequenceNr))
+      msgProbe.expectMsg(("b", event1b.vectorTimestamp, event1b.localSequenceNr))
     }
-    "recover from events that are replayed in chunks" in {
+    "recover from events that are replayed in batches" in {
       val actor = unrecoveredEventsourcedView(2)
 
       logProbe.expectMsg(LoadSnapshot(emitterIdA, actor, instanceId))
@@ -129,9 +170,9 @@ class EventsourcedViewSpec extends TestKit(ActorSystem("test")) with WordSpecLik
       actor ! Replaying(event1c, instanceId)
       actor ! ReplaySuccess(instanceId)
 
-      dstProbe.expectMsg(("a", event1a.vectorTimestamp, event1a.localSequenceNr))
-      dstProbe.expectMsg(("b", event1b.vectorTimestamp, event1b.localSequenceNr))
-      dstProbe.expectMsg(("c", event1c.vectorTimestamp, event1c.localSequenceNr))
+      msgProbe.expectMsg(("a", event1a.vectorTimestamp, event1a.localSequenceNr))
+      msgProbe.expectMsg(("b", event1b.vectorTimestamp, event1b.localSequenceNr))
+      msgProbe.expectMsg(("c", event1c.vectorTimestamp, event1c.localSequenceNr))
     }
     "retry recovery on failure" in {
       val actor = unrecoveredEventsourcedView()
@@ -154,10 +195,10 @@ class EventsourcedViewSpec extends TestKit(ActorSystem("test")) with WordSpecLik
       actor ! Replaying(event1c, instanceId + 1)
       actor ! ReplaySuccess(instanceId + 1)
 
-      dstProbe.expectMsg(("a", event1a.vectorTimestamp, event1a.localSequenceNr))
-      dstProbe.expectMsg(("a", event1a.vectorTimestamp, event1a.localSequenceNr))
-      dstProbe.expectMsg(("b", event1b.vectorTimestamp, event1b.localSequenceNr))
-      dstProbe.expectMsg(("c", event1c.vectorTimestamp, event1c.localSequenceNr))
+      msgProbe.expectMsg(("a", event1a.vectorTimestamp, event1a.localSequenceNr))
+      msgProbe.expectMsg(("a", event1a.vectorTimestamp, event1a.localSequenceNr))
+      msgProbe.expectMsg(("b", event1b.vectorTimestamp, event1b.localSequenceNr))
+      msgProbe.expectMsg(("c", event1c.vectorTimestamp, event1c.localSequenceNr))
     }
     "stash commands during recovery and handle them after initial recovery" in {
       val actor = unrecoveredEventsourcedView()
@@ -169,11 +210,11 @@ class EventsourcedViewSpec extends TestKit(ActorSystem("test")) with WordSpecLik
       actor ! Ping(3)
       actor ! ReplaySuccess(instanceId)
 
-      dstProbe.expectMsg(("a", event1a.vectorTimestamp, event1a.localSequenceNr))
-      dstProbe.expectMsg(("b", event1b.vectorTimestamp, event1b.localSequenceNr))
-      dstProbe.expectMsg(Pong(1))
-      dstProbe.expectMsg(Pong(2))
-      dstProbe.expectMsg(Pong(3))
+      msgProbe.expectMsg(("a", event1a.vectorTimestamp, event1a.localSequenceNr))
+      msgProbe.expectMsg(("b", event1b.vectorTimestamp, event1b.localSequenceNr))
+      msgProbe.expectMsg(Pong(1))
+      msgProbe.expectMsg(Pong(2))
+      msgProbe.expectMsg(Pong(3))
     }
     "stash commands during recovery and handle them after retried recovery" in {
       val actor = unrecoveredEventsourcedView()
@@ -198,12 +239,12 @@ class EventsourcedViewSpec extends TestKit(ActorSystem("test")) with WordSpecLik
       actor ! Replaying(event1c, instanceId + 1)
       actor ! ReplaySuccess(instanceId + 1)
 
-      dstProbe.expectMsg(("a", event1a.vectorTimestamp, event1a.localSequenceNr))
-      dstProbe.expectMsg(("a", event1a.vectorTimestamp, event1a.localSequenceNr))
-      dstProbe.expectMsg(("b", event1b.vectorTimestamp, event1b.localSequenceNr))
-      dstProbe.expectMsg(("c", event1c.vectorTimestamp, event1c.localSequenceNr))
-      dstProbe.expectMsg(Pong(1))
-      dstProbe.expectMsg(Pong(2))
+      msgProbe.expectMsg(("a", event1a.vectorTimestamp, event1a.localSequenceNr))
+      msgProbe.expectMsg(("a", event1a.vectorTimestamp, event1a.localSequenceNr))
+      msgProbe.expectMsg(("b", event1b.vectorTimestamp, event1b.localSequenceNr))
+      msgProbe.expectMsg(("c", event1c.vectorTimestamp, event1c.localSequenceNr))
+      msgProbe.expectMsg(Pong(1))
+      msgProbe.expectMsg(Pong(2))
     }
     "stash live events consumed during recovery" in {
       val actor = unrecoveredEventsourcedView()
@@ -212,10 +253,10 @@ class EventsourcedViewSpec extends TestKit(ActorSystem("test")) with WordSpecLik
       actor ! Replaying(event2b, instanceId)
       actor ! Written(event2d) // live event
       actor ! ReplaySuccess(instanceId)
-      dstProbe.expectMsg(("a", event2a.vectorTimestamp, event2a.localSequenceNr))
-      dstProbe.expectMsg(("b", event2b.vectorTimestamp, event2b.localSequenceNr))
-      dstProbe.expectMsg(("c", event2c.vectorTimestamp, event2c.localSequenceNr))
-      dstProbe.expectMsg(("d", event2d.vectorTimestamp, event2d.localSequenceNr))
+      msgProbe.expectMsg(("a", event2a.vectorTimestamp, event2a.localSequenceNr))
+      msgProbe.expectMsg(("b", event2b.vectorTimestamp, event2b.localSequenceNr))
+      msgProbe.expectMsg(("c", event2c.vectorTimestamp, event2c.localSequenceNr))
+      msgProbe.expectMsg(("d", event2d.vectorTimestamp, event2d.localSequenceNr))
     }
     "ignore live events targeted at previous incarnations" in {
       val actor = unrecoveredEventsourcedView()
@@ -231,8 +272,8 @@ class EventsourcedViewSpec extends TestKit(ActorSystem("test")) with WordSpecLik
       actor ! "boom"
       actor ! Written(event2c) // live event
 
-      dstProbe.expectMsg(("a", event2a.vectorTimestamp, event2a.localSequenceNr))
-      dstProbe.expectMsg(("b", event2b.vectorTimestamp, event2b.localSequenceNr))
+      msgProbe.expectMsg(("a", event2a.vectorTimestamp, event2a.localSequenceNr))
+      msgProbe.expectMsg(("b", event2b.vectorTimestamp, event2b.localSequenceNr))
 
       logProbe.expectMsg(LoadSnapshot(emitterIdA, actor, next))
       actor ! LoadSnapshotSuccess(None, next)
@@ -244,10 +285,93 @@ class EventsourcedViewSpec extends TestKit(ActorSystem("test")) with WordSpecLik
       actor ! ReplaySuccess(next)
       actor ! Written(event2d) // live event
 
-      dstProbe.expectMsg(("a", event2a.vectorTimestamp, event2a.localSequenceNr))
-      dstProbe.expectMsg(("b", event2b.vectorTimestamp, event2b.localSequenceNr))
-      dstProbe.expectMsg(("c", event2c.vectorTimestamp, event2c.localSequenceNr))
-      dstProbe.expectMsg(("d", event2d.vectorTimestamp, event2d.localSequenceNr))
+      msgProbe.expectMsg(("a", event2a.vectorTimestamp, event2a.localSequenceNr))
+      msgProbe.expectMsg(("b", event2b.vectorTimestamp, event2b.localSequenceNr))
+      msgProbe.expectMsg(("c", event2c.vectorTimestamp, event2c.localSequenceNr))
+      msgProbe.expectMsg(("d", event2d.vectorTimestamp, event2d.localSequenceNr))
+    }
+    "support user stash-unstash operations" in {
+      val actor = recoveredStashingView()
+
+      actor ! Ping(1)
+      actor ! "stash-on"
+      actor ! Ping(2)
+      actor ! "stash-off"
+      actor ! Ping(3)
+      actor ! "unstash"
+      actor ! Ping(4)
+
+      msgProbe.expectMsg(Pong(1))
+      msgProbe.expectMsg(Pong(3))
+      msgProbe.expectMsg(Pong(2))
+      msgProbe.expectMsg(Pong(4))
+    }
+    "support user unstash operations in event handler" in {
+      val actor = recoveredStashingView()
+
+      actor ! Ping(1)
+      actor ! "stash-on"
+      actor ! Ping(2)
+      actor ! "stash-off"
+      actor ! Ping(3)
+      actor ! Written(event("unstash", 1))
+      actor ! Ping(4)
+
+      msgProbe.expectMsg(Pong(1))
+      msgProbe.expectMsg(Pong(3))
+      msgProbe.expectMsg(Pong(2))
+      msgProbe.expectMsg(Pong(4))
+    }
+    "support user stash-unstash operations where unstash is the last operation" in {
+      val actor = recoveredStashingView()
+
+      actor ! Ping(1)
+      actor ! "stash-on"
+      actor ! Ping(2)
+      actor ! "stash-off"
+      actor ! Ping(3)
+      actor ! "unstash"
+
+      msgProbe.expectMsg(Pong(1))
+      msgProbe.expectMsg(Pong(3))
+      msgProbe.expectMsg(Pong(2))
+    }
+    "support user stash-unstash operations under failure conditions (failure before stash)" in {
+      val actor = recoveredStashingView()
+
+      actor ! Ping(1)
+      actor ! "boom"
+      actor ! "stash-on"
+      actor ! Ping(2)
+      actor ! "stash-off"
+      actor ! Ping(3)
+      actor ! "unstash"
+      actor ! Ping(4)
+
+      processRecover(actor, instanceId + 1)
+
+      msgProbe.expectMsg(Pong(1))
+      msgProbe.expectMsg(Pong(3))
+      msgProbe.expectMsg(Pong(2))
+      msgProbe.expectMsg(Pong(4))
+    }
+    "support user stash-unstash operations under failure conditions (failure after stash)" in {
+      val actor = recoveredStashingView()
+
+      actor ! Ping(1)
+      actor ! "stash-on"
+      actor ! Ping(2)
+      actor ! "boom"
+      actor ! Ping(3)
+      actor ! "unstash"
+      actor ! Ping(4)
+
+      processRecover(actor, instanceId + 1)
+
+      msgProbe.expectMsg(Pong(1))
+      msgProbe.expectMsg(Pong(2))
+      msgProbe.expectMsg(Pong(3))
+      msgProbe.expectMsg(Pong(4))
     }
   }
 }

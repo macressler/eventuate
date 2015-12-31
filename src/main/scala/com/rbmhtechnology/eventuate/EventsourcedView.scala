@@ -28,7 +28,7 @@ import com.typesafe.config.Config
 import scala.util._
 
 private class EventsourcedViewSettings(config: Config) {
-  val chunkSizeMax = config.getInt("eventuate.replay.chunk-size-max")
+  val replayBatchSize = config.getInt("eventuate.log.replay-batch-size")
 }
 
 object EventsourcedView {
@@ -62,7 +62,7 @@ object EventsourcedView {
  * Commands sent to an `EventsourcedView` during recovery are delayed until recovery completes.
  *
  * Event replay is subject to backpressure. After a configurable number of events
- * (see `eventuate.replay.chunk-size-max` configuration parameter), replay is suspended until these
+ * (see `eventuate.log.replay-batch-size` configuration parameter), replay is suspended until these
  * events have been handled by `onEvent` and then resumed again. There's no backpressure mechanism
  * for live event processing yet (but will come in future releases).
  *
@@ -83,6 +83,7 @@ trait EventsourcedView extends Actor with Stash with ActorLogging {
   val instanceId: Int = instanceIdCounter.getAndIncrement()
 
   private var _recovering: Boolean = true
+  private var _eventHandling: Boolean = false
   private var _lastHandledEvent: DurableEvent = _
 
   private val settings = new EventsourcedViewSettings(context.system.settings.config)
@@ -90,11 +91,6 @@ trait EventsourcedView extends Actor with Stash with ActorLogging {
 
   private lazy val currentOnCommand: Receive = onCommand
   private lazy val currentOnEvent: Receive = onEvent
-
-  /**
-   * Internal API.
-   */
-  private[eventuate] val messageStash = new MessageStash()
 
   /**
    * Internal API.
@@ -115,11 +111,11 @@ trait EventsourcedView extends Actor with Stash with ActorLogging {
   /**
    * Maximum number of events to be replayed to this actor before replaying is suspended. A suspended replay
    * is resumed automatically after all replayed events haven been handled by this actor's event handler
-   * (= backpressure). The default value for the maximum replay chunk size is given by configuration item
-   * `eventuate.replay.chunk-size-max`. Configured values can be overridden by overriding this method.
+   * (= backpressure). The default value for the maximum replay batch size is given by configuration item
+   * `eventuate.log.replay-batch-size`. Configured values can be overridden by overriding this method.
    */
-  def replayChunkSizeMax: Int =
-    settings.chunkSizeMax
+  def replayBatchSize: Int =
+    settings.replayBatchSize
 
   /**
    * Global unique actor id.
@@ -164,6 +160,12 @@ trait EventsourcedView extends Actor with Stash with ActorLogging {
   /**
    * Internal API.
    */
+  private[eventuate] def eventHandling: Boolean =
+    _eventHandling
+
+  /**
+   * Internal API.
+   */
   private[eventuate] def recovered(): Unit = {
     _recovering = false
     onRecovered()
@@ -173,11 +175,12 @@ trait EventsourcedView extends Actor with Stash with ActorLogging {
    * Internal API.
    */
   private[eventuate] def receiveEvent(event: DurableEvent): Unit = {
-    if (currentOnEvent.isDefinedAt(event.payload)) {
+    if (currentOnEvent.isDefinedAt(event.payload)) try {
+      _eventHandling = true
       receiveEventInternal(event)
       currentOnEvent(event.payload)
       if (!recovering) conditionChanged(currentVectorTime)
-    }
+    } finally _eventHandling = false
   }
 
   /**
@@ -306,7 +309,7 @@ trait EventsourcedView extends Actor with Stash with ActorLogging {
    */
   //#replay
   private[eventuate] def replay(fromSequenceNr: Long = 1L): Unit =
-    eventLog ! Replay(fromSequenceNr, replayChunkSizeMax, self, aggregateId, instanceId)
+    eventLog ! Replay(fromSequenceNr, replayBatchSize, self, aggregateId, instanceId)
   //#
 
   /**
@@ -333,20 +336,20 @@ trait EventsourcedView extends Actor with Stash with ActorLogging {
       receiveEvent(event)
     }
     case ReplaySuspended(iid) => if (iid == instanceId) {
-      sender() ! ReplayNext(replayChunkSizeMax, iid)
+      sender() ! ReplayNext(replayBatchSize, iid)
     }
     case ReplaySuccess(iid) => if (iid == instanceId) {
       context.become(initiated)
       conditionChanged(currentVectorTime)
-      messageStash.unstashAll()
       recovered()
+      unstashAll()
     }
     case ReplayFailure(cause, iid) => if (iid == instanceId) {
       log.error(cause, s"replay failed, stopping self")
       context.stop(self)
     }
     case other =>
-      messageStash.stash()
+      stash()
   }
 
   /**
@@ -376,6 +379,27 @@ trait EventsourcedView extends Actor with Stash with ActorLogging {
   final def receive = initiating
 
   /**
+   * Adds the current command to the user's command stash. Must not be used in the event handler.
+   */
+  override def stash(): Unit =
+    if (eventHandling) throw new StashError("stash() must not be used in event handler") else super.stash()
+
+  /**
+   * Prepends all stashed commands to the actor's mailbox and then clears the command stash.
+   * Has no effect if the actor is recovering i.e. if `recovering` returns `true`.
+   */
+  override def unstashAll(): Unit =
+    if (!recovering) super.unstashAll()
+
+  /**
+   * Sets `recovering` to `false` before calling `super.preRestart`.
+   */
+  override def preRestart(reason: Throwable, message: Option[Any]): Unit = {
+    _recovering = false
+    super.preRestart(reason, message)
+  }
+
+  /**
    * Initiates recovery.
    */
   override def preStart(): Unit = {
@@ -384,16 +408,12 @@ trait EventsourcedView extends Actor with Stash with ActorLogging {
   }
 
   /**
-   * Unstashes all commands from internal stash and calls `super.preRestart`.
+   * Sets `recovering` to `false` before calling `super.postStop`.
    */
-  override def preRestart(reason: Throwable, message: Option[Any]): Unit =
-    try messageStash.unstashAll() finally super.preRestart(reason, message)
-
-  /**
-   * Unstashes all commands from internal stash and calls `super.postStop`.
-   */
-  override def postStop(): Unit =
-    try messageStash.unstashAll() finally super.postStop()
+  override def postStop(): Unit = {
+    _recovering = false
+    super.postStop()
+  }
 }
 
 /**

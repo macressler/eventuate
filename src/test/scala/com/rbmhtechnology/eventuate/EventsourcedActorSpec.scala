@@ -17,16 +17,23 @@
 package com.rbmhtechnology.eventuate
 
 import akka.actor._
+import akka.pattern.AskTimeoutException
 import akka.testkit._
 
 import com.rbmhtechnology.eventuate.ConfirmedDelivery._
+import com.typesafe.config.ConfigFactory
 
 import org.scalatest._
 
+import scala.collection.immutable.Seq
+import scala.concurrent.duration._
 import scala.util._
 
 object EventsourcedActorSpec {
   import EventsourcedViewSpec._
+
+  val config = ConfigFactory.parseString("eventuate.log.write-timeout = 1s")
+  val timeout = 0.2.seconds
 
   case class Cmd(payload: Any, num: Int = 1)
   case class Deliver(payload: Any)
@@ -94,16 +101,18 @@ object EventsourcedActorSpec {
         stash()
       case Ping(i) =>
         msgProbe ! Pong(i)
-      case Cmd(p, num) => 1 to num foreach { i =>
-        persist(s"${p}-${i}") {
+      case Cmd(p, _) =>
+        persist(p) {
           case Success(evt) =>
           case Failure(err) => msgProbe ! err
         }
-      }
     }
 
     override def onEvent = {
-      case evt => msgProbe ! evt
+      case "unstash" =>
+        unstashAll()
+      case evt =>
+        msgProbe ! evt
     }
   }
 
@@ -178,7 +187,9 @@ object EventsourcedActorSpec {
   }
 }
 
-class EventsourcedActorSpec extends TestKit(ActorSystem("test")) with WordSpecLike with Matchers with BeforeAndAfterAll with BeforeAndAfterEach {
+class EventsourcedActorSpec extends TestKit(ActorSystem("test", EventsourcedActorSpec.config))
+  with WordSpecLike with Matchers with BeforeAndAfterAll with BeforeAndAfterEach {
+
   import EventsourcedViewSpec._
   import EventsourcedActorSpec._
   import EventsourcingProtocol._
@@ -219,7 +230,7 @@ class EventsourcedActorSpec extends TestKit(ActorSystem("test")) with WordSpecLi
   def recoveredCausalityActor(sharedClockEntry: Boolean): ActorRef =
     processRecover(unrecoveredCausalityActor(sharedClockEntry))
 
-  def stashingActor(probe: ActorRef, stateSync: Boolean): ActorRef =
+  def recoveredStashingActor(probe: ActorRef, stateSync: Boolean): ActorRef =
     processRecover(system.actorOf(Props(new TestStashingActor(logProbe.ref, probe, stateSync))))
 
   def processRecover(actor: ActorRef): ActorRef = {
@@ -230,9 +241,9 @@ class EventsourcedActorSpec extends TestKit(ActorSystem("test")) with WordSpecLi
     actor
   }
 
-  def processWrite(actor: ActorRef, snr: Long): Unit = {
+  def processWrite(snr: Long): Unit = {
     val write = logProbe.expectMsgClass(classOf[Write])
-    actor ! WriteSuccess(event(write.events(0).payload, snr), instanceId)
+    logProbe.sender() ! WriteSuccess(Seq(event(write.events.head.payload, snr)), write.correlationId, instanceId)
   }
 
   "An EventsourcedActor" when {
@@ -246,9 +257,7 @@ class EventsourcedActorSpec extends TestKit(ActorSystem("test")) with WordSpecLi
         val write = logProbe.expectMsgClass(classOf[Write])
         write.events(0).payload should be("a-1")
         write.events(1).payload should be("a-2")
-
-        actor ! WriteSuccess(event("a-1", 1L), instanceId)
-        actor ! WriteSuccess(event("a-2", 2L), instanceId)
+        logProbe.sender() ! WriteSuccess(Seq(event("a-1", 1L), event("a-2", 2L)), write.correlationId, instanceId)
 
         evtProbe.expectMsg(("a-1", timestamp(1), timestamp(1), 1))
         evtProbe.expectMsg(("a-2", timestamp(2), timestamp(2), 2))
@@ -261,8 +270,7 @@ class EventsourcedActorSpec extends TestKit(ActorSystem("test")) with WordSpecLi
         actor ! Cmd("b", 2)
 
         val write1 = logProbe.expectMsgClass(classOf[Write])
-        actor ! WriteSuccess(event("boom", 1L), instanceId)
-        actor ! WriteSuccess(event("a-2", 2L), instanceId)
+        logProbe.sender() ! WriteSuccess(Seq(event("boom", 1L), event("a-2", 2L)), write1.correlationId, instanceId)
 
         logProbe.expectMsg(LoadSnapshot(emitterIdA, actor, instanceId + 1))
         actor ! LoadSnapshotSuccess(None, instanceId + 1)
@@ -274,75 +282,207 @@ class EventsourcedActorSpec extends TestKit(ActorSystem("test")) with WordSpecLi
         val write2 = logProbe.expectMsgClass(classOf[Write])
         write2.events(0).payload should be("b-1")
         write2.events(1).payload should be("b-2")
-        actor ! WriteSuccess(event("b-1", 3L), instanceId + 1)
-        actor ! WriteSuccess(event("b-2", 4L), instanceId + 1)
+        logProbe.sender() ! WriteSuccess(Seq(event("b-1", 3L), event("b-2", 4L)), write2.correlationId, instanceId + 1)
 
         evtProbe.expectMsg(("a-1", timestamp(1), timestamp(1), 1))
         evtProbe.expectMsg(("a-2", timestamp(2), timestamp(2), 2))
         evtProbe.expectMsg(("b-1", timestamp(3), timestamp(3), 3))
         evtProbe.expectMsg(("b-2", timestamp(4), timestamp(4), 4))
       }
-      "support user stash operations" in {
+      "fix #182" in {
         val probe = TestProbe()
-        val actor = stashingActor(probe.ref, stateSync = true)
+        val actor = recoveredStashingActor(probe.ref, stateSync = true)
 
-        actor ! Cmd("a", 1)
+        actor ! Cmd("c")
+        actor ! "stash-on"
+        actor ! Ping(1)
+        actor ! "stash-off"
+        actor ! Ping(2)
+        actor ! "unstash"
+        actor ! Ping(3)
+
+        processWrite(1)
+
+        probe.expectMsg("c")
+        probe.expectMsg(Pong(2))
+        probe.expectMsg(Pong(1))
+        probe.expectMsg(Pong(3))
+      }
+      "support user stash-unstash operations that are within a write" in {
+        val probe = TestProbe()
+        val actor = recoveredStashingActor(probe.ref, stateSync = true)
+
+        actor ! Cmd("a")
+        actor ! "stash-on"
+        actor ! Ping(1)
+        actor ! "stash-off"
+        actor ! Ping(2)
+        actor ! "unstash"
+
+        processWrite(1)
+
+        actor ! Cmd("b")
+
+        processWrite(2)
+
+        probe.expectMsg("a")
+        probe.expectMsg(Pong(2))
+        probe.expectMsg(Pong(1))
+        probe.expectMsg("b")
+      }
+      "support repeated user stash-unstash operations that are within a write" in {
+        val probe = TestProbe()
+        val actor = recoveredStashingActor(probe.ref, stateSync = true)
+
+        actor ! Cmd("a")
+        actor ! "stash-on"
+        actor ! Ping(1)
+        actor ! "stash-off"
+        actor ! Ping(2)
+        actor ! "unstash"
+        actor ! Ping(3)
+        actor ! "stash-on"
+        actor ! Ping(4)
+        actor ! "stash-off"
+        actor ! Ping(5)
+        actor ! "unstash"
+
+        processWrite(1)
+
+        actor ! Cmd("b")
+
+        processWrite(2)
+
+        probe.expectMsg("a")
+        probe.expectMsg(Pong(2))
+        probe.expectMsg(Pong(1))
+        probe.expectMsg(Pong(3))
+        probe.expectMsg(Pong(5))
+        probe.expectMsg(Pong(4))
+        probe.expectMsg("b")
+      }
+      "support user stash-unstash operations that overlap with a write" in {
+        val probe = TestProbe()
+        val actor = recoveredStashingActor(probe.ref, stateSync = true)
+
+        actor ! Cmd("a")
         actor ! "stash-on"
         actor ! Ping(1)
         actor ! "stash-off"
         actor ! Ping(2)
 
-        processWrite(actor, 1)
+        processWrite(1)
 
-        actor ! Cmd("b", 1)
         actor ! "unstash"
+        actor ! Cmd("b")
 
-        processWrite(actor, 1)
+        processWrite(2)
 
-        probe.expectMsg("a-1")
+        probe.expectMsg("a")
         probe.expectMsg(Pong(2))
-        probe.expectMsg("b-1")
         probe.expectMsg(Pong(1))
+        probe.expectMsg("b")
+      }
+      "support user stash-unstash operations that span writes" in {
+        val probe = TestProbe()
+        val actor = recoveredStashingActor(probe.ref, stateSync = true)
 
-        actor ! Cmd("c", 1)
+        actor ! Cmd("a")
         actor ! "stash-on"
-        actor ! Ping(3)
+        actor ! Ping(1)
         actor ! "stash-off"
-        actor ! Ping(4)
+        actor ! Ping(2)
 
-        processWrite(actor, 3)
+        processWrite(1)
 
+        actor ! Cmd("b")
         actor ! "unstash"
-        actor ! Cmd("d", 1)
 
-        processWrite(actor, 4)
+        processWrite(2)
 
-        probe.expectMsg("c-1")
-        probe.expectMsg(Pong(4))
+        probe.expectMsg("a")
+        probe.expectMsg(Pong(2))
+        probe.expectMsg("b")
+        probe.expectMsg(Pong(1))
+      }
+      "support user unstash operations in event handler" in {
+        val probe = TestProbe()
+        val actor = recoveredStashingActor(probe.ref, stateSync = true)
+
+        actor ! Cmd("a")
+        actor ! "stash-on"
+        actor ! Ping(1)
+        actor ! "stash-off"
+        actor ! Ping(2)
+
+        processWrite(1)
+
+        actor ! Cmd("unstash")
+
+        processWrite(2)
+
+        actor ! Cmd("b")
+
+        processWrite(3)
+
+        probe.expectMsg("a")
+        probe.expectMsg(Pong(2))
+        probe.expectMsg(Pong(1))
+        probe.expectMsg("b")
+      }
+      "support user stash-unstash operations that are within a write where unstash is the last operation" in {
+        val probe = TestProbe()
+        val actor = recoveredStashingActor(probe.ref, stateSync = true)
+
+        actor ! Cmd("a")
+        actor ! "stash-on"
+        actor ! Ping(1)
+        actor ! "stash-off"
+        actor ! Ping(2)
+        actor ! "unstash"
+
+        processWrite(1)
+
+        probe.expectMsg("a")
+        probe.expectMsg(Pong(2))
+        probe.expectMsg(Pong(1))
+      }
+      "support user stash-unstash operations that are outside a write where unstash is the last operation" in {
+        val probe = TestProbe()
+        val actor = recoveredStashingActor(probe.ref, stateSync = true)
+
+        actor ! Ping(1)
+        actor ! "stash-on"
+        actor ! Ping(2)
+        actor ! "stash-off"
+        actor ! Ping(3)
+        actor ! "unstash"
+
+        probe.expectMsg(Pong(1))
         probe.expectMsg(Pong(3))
-        probe.expectMsg("d-1")
+        probe.expectMsg(Pong(2))
       }
       "support user stash operations under failure conditions" in {
         val probe = TestProbe()
-        val actor = stashingActor(probe.ref, stateSync = true)
+        val actor = recoveredStashingActor(probe.ref, stateSync = true)
 
-        actor ! Cmd("a", 1)
+        actor ! Cmd("a")
         actor ! "stash-on"
         actor ! Ping(1)
         actor ! "stash-off"
         actor ! "boom"
         actor ! Ping(2)
 
-        processWrite(actor, 1)
-        probe.expectMsg("a-1")
+        processWrite(1)
+        probe.expectMsg("a")
 
         logProbe.expectMsg(LoadSnapshot(emitterIdA, actor, instanceId + 1))
         actor ! LoadSnapshotSuccess(None, instanceId + 1)
         logProbe.expectMsg(Replay(1, actor, instanceId + 1))
-        actor ! Replaying(event("a-1", 1), instanceId + 1)
+        actor ! Replaying(event("a", 1), instanceId + 1)
         actor ! ReplaySuccess(instanceId + 1)
 
-        probe.expectMsg("a-1")
+        probe.expectMsg("a")
         probe.expectMsg(Pong(1))
         probe.expectMsg(Pong(2))
       }
@@ -355,8 +495,8 @@ class EventsourcedActorSpec extends TestKit(ActorSystem("test")) with WordSpecLi
         val write = logProbe.expectMsgClass(classOf[Write])
         write.events(0).payload should be("a-1")
         write.events(1).payload should be("a-2")
-        actor ! WriteSuccess(event("a-1", 1L), instanceId)
-        actor ! WriteSuccess(event("a-2", 2L), instanceId)
+        logProbe.sender() ! WriteSuccess(Seq(event("a-1", 1L), event("a-2", 2L)), write.correlationId, instanceId)
+
         cmdProbe.expectMsg(Pong(1))
         evtProbe.expectMsg(("a-1", timestamp(1), timestamp(1), 1L))
         evtProbe.expectMsg(("a-2", timestamp(2), timestamp(2), 2))
@@ -368,8 +508,7 @@ class EventsourcedActorSpec extends TestKit(ActorSystem("test")) with WordSpecLi
         actor ! Cmd("b", 2)
 
         val write1 = logProbe.expectMsgClass(classOf[Write])
-        actor ! WriteSuccess(event("boom", 1L), instanceId)
-        actor ! WriteSuccess(event("a-2", 2L), instanceId)
+        logProbe.sender() ! WriteSuccess(Seq(event("boom", 1L), event("a-2", 2L)), write1.correlationId, instanceId)
 
         logProbe.expectMsg(LoadSnapshot(emitterIdA, actor, instanceId + 1))
         actor ! LoadSnapshotSuccess(None, instanceId + 1)
@@ -381,13 +520,158 @@ class EventsourcedActorSpec extends TestKit(ActorSystem("test")) with WordSpecLi
         val write2 = logProbe.expectMsgClass(classOf[Write])
         write2.events(0).payload should be("b-1")
         write2.events(1).payload should be("b-2")
-        actor ! WriteSuccess(event("b-1", 3L), instanceId + 1)
-        actor ! WriteSuccess(event("b-2", 4L), instanceId + 1)
+        logProbe.sender() ! WriteSuccess(Seq(event("b-1", 3L), event("b-2", 4L)), write2.correlationId, instanceId + 1)
 
         evtProbe.expectMsg(("a-1", timestamp(1), timestamp(1), 1))
         evtProbe.expectMsg(("a-2", timestamp(2), timestamp(2), 2))
         evtProbe.expectMsg(("b-1", timestamp(3), timestamp(3), 3))
         evtProbe.expectMsg(("b-2", timestamp(4), timestamp(4), 4))
+      }
+      "fix #182" in {
+        val probe = TestProbe()
+        val actor = recoveredStashingActor(probe.ref, stateSync = false)
+
+        actor ! Cmd("c")
+        actor ! "stash-on"
+        actor ! Ping(1)
+        actor ! "stash-off"
+        actor ! Ping(2)
+        actor ! "unstash"
+        actor ! Ping(3)
+
+        processWrite(1)
+
+        probe.expectMsg(Pong(2))
+        probe.expectMsg(Pong(1))
+        probe.expectMsg(Pong(3))
+        probe.expectMsg("c")
+      }
+      "support user stash-unstash operations that are within a write" in {
+        val probe = TestProbe()
+        val actor = recoveredStashingActor(probe.ref, stateSync = false)
+
+        actor ! Cmd("a")
+        actor ! "stash-on"
+        actor ! Ping(1)
+        actor ! "stash-off"
+        actor ! Ping(2)
+        actor ! "unstash"
+
+        processWrite(1)
+
+        actor ! Cmd("b")
+
+        processWrite(2)
+
+        probe.expectMsg(Pong(2))
+        probe.expectMsg(Pong(1))
+        probe.expectMsg("a")
+        probe.expectMsg("b")
+
+      }
+      "support user stash-unstash operations that overlap with a write" in {
+        val probe = TestProbe()
+        val actor = recoveredStashingActor(probe.ref, stateSync = false)
+
+        actor ! Cmd("a")
+        actor ! "stash-on"
+        actor ! Ping(1)
+        actor ! "stash-off"
+        actor ! Ping(2)
+
+        processWrite(1)
+
+        actor ! "unstash"
+        actor ! Cmd("b")
+
+        processWrite(2)
+
+        probe.expectMsg(Pong(2))
+        probe.expectMsg("a")
+        probe.expectMsg(Pong(1))
+        probe.expectMsg("b")
+      }
+      "support user stash-unstash operations that span writes" in {
+        val probe = TestProbe()
+        val actor = recoveredStashingActor(probe.ref, stateSync = false)
+
+        actor ! Cmd("a")
+        actor ! "stash-on"
+        actor ! Ping(1)
+        actor ! "stash-off"
+        actor ! Ping(2)
+
+        processWrite(1)
+
+        actor ! Cmd("b")
+        actor ! "unstash"
+
+        processWrite(2)
+
+        probe.expectMsg(Pong(2))
+        probe.expectMsg("a")
+        probe.expectMsg(Pong(1))
+        probe.expectMsg("b")
+      }
+      "support user unstash operations in event handler" in {
+        val probe = TestProbe()
+        val actor = recoveredStashingActor(probe.ref, stateSync = false)
+
+        actor ! Cmd("a")
+        actor ! "stash-on"
+        actor ! Ping(1)
+        actor ! "stash-off"
+        actor ! Ping(2)
+        processWrite(1)
+
+        actor ! Cmd("unstash")
+
+        processWrite(2)
+
+        actor ! Cmd("b")
+
+        processWrite(3)
+
+        probe.expectMsg(Pong(2))
+        probe.expectMsg("a")
+        probe.expectMsg(Pong(1))
+        probe.expectMsg("b")
+      }
+      "support user stash-unstash operations where unstash is the last operation" in {
+        val probe = TestProbe()
+        val actor = recoveredStashingActor(probe.ref, stateSync = false)
+
+        actor ! "stash-on"
+        actor ! Ping(1)
+        actor ! "stash-off"
+        actor ! Ping(2)
+        actor ! "unstash"
+
+        probe.expectMsg(Pong(2))
+        probe.expectMsg(Pong(1))
+      }
+      "support user stash operations under failure conditions" in {
+        val probe = TestProbe()
+        val actor = recoveredStashingActor(probe.ref, stateSync = false)
+
+        actor ! Cmd("a")
+        actor ! "stash-on"
+        actor ! Ping(1)
+        actor ! "stash-off"
+        actor ! "boom"
+        actor ! Ping(2)
+
+        processWrite(1) // ignored
+
+        logProbe.expectMsg(LoadSnapshot(emitterIdA, actor, instanceId + 1))
+        actor ! LoadSnapshotSuccess(None, instanceId + 1)
+        logProbe.expectMsg(Replay(1, actor, instanceId + 1))
+        actor ! Replaying(event("a", 1), instanceId + 1)
+        actor ! ReplaySuccess(instanceId + 1)
+
+        probe.expectMsg("a") // from replay
+        probe.expectMsg(Pong(1))
+        probe.expectMsg(Pong(2))
       }
     }
     "in any mode" must {
@@ -406,8 +690,7 @@ class EventsourcedActorSpec extends TestKit(ActorSystem("test")) with WordSpecLi
 
         actor ! Written(eventB1)
         actor ! Written(eventB2)
-        actor ! WriteSuccess(eventA1, instanceId)
-        actor ! WriteSuccess(eventA2, instanceId)
+        logProbe.sender() ! WriteSuccess(Seq(eventA1, eventA2), write.correlationId, instanceId)
 
         evtProbe.expectMsg(("b-1", timestamp(0, 1), timestamp(1, 1), 1L))
         evtProbe.expectMsg(("b-2", timestamp(0, 2), timestamp(2, 2), 2L))
@@ -421,9 +704,7 @@ class EventsourcedActorSpec extends TestKit(ActorSystem("test")) with WordSpecLi
         val write = logProbe.expectMsgClass(classOf[Write])
         write.events(0).payload should be("a")
         write.events(1).payload should be("b")
-
-        actor ! WriteSuccess(event("a", 1), instanceId)
-        actor ! WriteSuccess(event("b", 2), instanceId)
+        logProbe.sender() ! WriteSuccess(Seq(event("a", 1), event("b", 2)), write.correlationId, instanceId)
 
         evtProbe.expectMsg(("a", timestamp(1), timestamp(1), 1))
         cmdProbe.expectMsg(("a-1", timestamp(1), timestamp(1), 1))
@@ -439,10 +720,7 @@ class EventsourcedActorSpec extends TestKit(ActorSystem("test")) with WordSpecLi
         write.events(0).payload should be("a")
         write.events(1).payload should be("b")
         write.events(2).payload should be("c")
-
-        actor ! WriteSuccess(event("a", 1), instanceId)
-        actor ! WriteSuccess(event("b", 2), instanceId)
-        actor ! WriteSuccess(event("c", 3), instanceId)
+        logProbe.sender() ! WriteSuccess(Seq(event("a", 1), event("b", 2), event("c", 3)), write.correlationId, instanceId)
 
         evtProbe.expectMsg(("a", timestamp(1), timestamp(1), 1))
         cmdProbe.expectMsg(("a", timestamp(1), timestamp(1), 1))
@@ -461,9 +739,7 @@ class EventsourcedActorSpec extends TestKit(ActorSystem("test")) with WordSpecLi
         val write = logProbe.expectMsgClass(classOf[Write])
         val event1 = write.events(0)
         val event2 = write.events(1)
-
-        actor ! WriteFailure(event1, boom, instanceId)
-        actor ! WriteFailure(event2, boom, instanceId)
+        logProbe.sender() ! WriteFailure(Seq(event1, event2), boom, write.correlationId, instanceId)
 
         cmdProbe.expectMsg((boom, event1.vectorTimestamp, event1.vectorTimestamp, event1.localSequenceNr))
         cmdProbe.expectMsg((boom, event2.vectorTimestamp, event2.vectorTimestamp, event2.localSequenceNr))
@@ -492,6 +768,82 @@ class EventsourcedActorSpec extends TestKit(ActorSystem("test")) with WordSpecLi
         val actor = recoveredEventsourcedActor(stateSync = true)
         actor ! "unhandled-command"
         cmdProbe.expectMsg("unhandled-command")
+      }
+      "report write timeouts to persist handler and ignore later replies from event log" in {
+        val actor = recoveredEventsourcedActor(stateSync = true)
+        actor ! Cmd("a", 1)
+
+        val write = logProbe.expectMsgClass(classOf[Write])
+        val event = write.events(0)
+
+        cmdProbe.expectMsgPF() {
+          case (cause: AskTimeoutException, currentVectorTime, lastVectorTimestamp, lastSequenceNr) =>
+            currentVectorTime should be(event.vectorTimestamp)
+            lastVectorTimestamp should be(event.vectorTimestamp)
+            lastSequenceNr should be(event.localSequenceNr)
+        }
+
+        logProbe.sender() ! WriteSuccess(Seq(event), write.correlationId, instanceId)
+        cmdProbe.expectNoMsg(timeout)
+      }
+      "apply Write replies and Written messages in received order" in {
+        val probe = TestProbe()
+        val actor = recoveredStashingActor(probe.ref, stateSync = false)
+
+        actor ! Cmd("a", 1)
+        actor ! Cmd("b", 1)
+        actor ! Cmd("c", 1)
+
+        processWrite(1)
+        actor ! Written(event("x", 2))
+        processWrite(3)
+        actor ! Written(event("y", 4))
+        processWrite(5)
+        actor ! Written(event("z", 6))
+
+        probe.expectMsg("a")
+        probe.expectMsg("x")
+        probe.expectMsg("b")
+        probe.expectMsg("y")
+        probe.expectMsg("c")
+        probe.expectMsg("z")
+      }
+      "ignore WriteSuccess duplicates" in {
+        val probe = TestProbe()
+        val actor = recoveredStashingActor(probe.ref, stateSync = false)
+
+        actor ! Cmd("a", 1)
+        actor ! Cmd("b", 1)
+
+        val write1 = logProbe.expectMsgClass(classOf[Write])
+        logProbe.sender() ! WriteSuccess(Seq(event(write1.events.head.payload, 1)), write1.correlationId, instanceId)
+        logProbe.sender() ! WriteSuccess(Seq(event(write1.events.head.payload, 1)), write1.correlationId, instanceId)
+
+        val write2 = logProbe.expectMsgClass(classOf[Write])
+        logProbe.sender() ! WriteSuccess(Seq(event(write2.events.head.payload, 2)), write2.correlationId, instanceId)
+
+        probe.expectMsg("a")
+        probe.expectMsg("b")
+      }
+      "ignore WriteFailure duplicates" in {
+        val probe = TestProbe()
+        val actor = recoveredStashingActor(probe.ref, stateSync = false)
+
+        val e1 = new Exception("1")
+        val e2 = new Exception("2")
+
+        actor ! Cmd("a", 1)
+        actor ! Cmd("b", 1)
+
+        val write1 = logProbe.expectMsgClass(classOf[Write])
+        logProbe.sender() ! WriteFailure(write1.events, e1, write1.correlationId, instanceId)
+        logProbe.sender() ! WriteFailure(write1.events, e1, write1.correlationId, instanceId)
+
+        val write2 = logProbe.expectMsgClass(classOf[Write])
+        logProbe.sender() ! WriteFailure(write2.events, e2, write2.correlationId, instanceId)
+
+        probe.expectMsg(e1)
+        probe.expectMsg(e2)
       }
     }
   }
@@ -560,10 +912,11 @@ class EventsourcedActorSpec extends TestKit(ActorSystem("test")) with WordSpecLi
       actor ! Cmd("a")
       actor ! Cmd("b")
 
-      logProbe.expectMsgClass(classOf[Write])
-      actor ! WriteSuccess(event2, instanceId)
-      logProbe.expectMsgClass(classOf[Write])
-      actor ! WriteSuccess(event3, instanceId)
+      val write1 = logProbe.expectMsgClass(classOf[Write])
+      logProbe.sender() ! WriteSuccess(Seq(event2), write1.correlationId, instanceId)
+
+      val write2 = logProbe.expectMsgClass(classOf[Write])
+      logProbe.sender() ! WriteSuccess(Seq(event3), write2.correlationId, instanceId)
 
       evtProbe.expectMsg((Vector("x", "a"), timestamp(2, 1), timestamp(2, 1), 2))
       evtProbe.expectMsg((Vector("x", "a", "b"), timestamp(3, 1), timestamp(3, 1), 3))
@@ -580,14 +933,18 @@ class EventsourcedActorSpec extends TestKit(ActorSystem("test")) with WordSpecLi
       actor ! Cmd("b")
       actor ! Deliver("x")
       actor ! Deliver("y")
-      logProbe.expectMsgClass(classOf[Write])
-      actor ! WriteSuccess(event("a", 1), instanceId)
-      logProbe.expectMsgClass(classOf[Write])
-      actor ! WriteSuccess(event("b", 2), instanceId)
-      logProbe.expectMsgClass(classOf[Write])
-      actor ! WriteSuccess(event(DeliverRequested("x"), 3), instanceId)
-      logProbe.expectMsgClass(classOf[Write])
-      actor ! WriteSuccess(event(DeliverRequested("y"), 4), instanceId)
+
+      val write1 = logProbe.expectMsgClass(classOf[Write])
+      logProbe.sender() ! WriteSuccess(Seq(event("a", 1)), write1.correlationId, instanceId)
+
+      val write2 = logProbe.expectMsgClass(classOf[Write])
+      logProbe.sender() ! WriteSuccess(Seq(event("b", 2)), write2.correlationId, instanceId)
+
+      val write3 = logProbe.expectMsgClass(classOf[Write])
+      logProbe.sender() ! WriteSuccess(Seq(event(DeliverRequested("x"), 3)), write3.correlationId, instanceId)
+
+      val write4 = logProbe.expectMsgClass(classOf[Write])
+      logProbe.sender() ! WriteSuccess(Seq(event(DeliverRequested("y"), 4)), write4.correlationId, instanceId)
 
       evtProbe.expectMsg((Vector("a"), timestamp(1), timestamp(1), 1))
       evtProbe.expectMsg((Vector("a", "b"), timestamp(2), timestamp(2), 2))
@@ -673,11 +1030,11 @@ class EventsourcedActorSpec extends TestKit(ActorSystem("test")) with WordSpecLi
 
         val write1 = logProbe.expectMsgClass(classOf[Write])
         write1.events.head.copy(systemTimestamp = 0L) should be(e2)
-        actor ! WriteSuccess(e2.copy(localLogId = logIdA, localSequenceNr = 2L), instanceId)
+        logProbe.sender() ! WriteSuccess(Seq(e2.copy(localLogId = logIdA, localSequenceNr = 2L)), write1.correlationId, instanceId)
 
         val write2 = logProbe.expectMsgClass(classOf[Write])
         write2.events.head.copy(systemTimestamp = 0L) should be(e3)
-        actor ! WriteSuccess(e3.copy(localLogId = logIdA, localSequenceNr = 3L), instanceId)
+        logProbe.sender() ! WriteSuccess(Seq(e3.copy(localLogId = logIdA, localSequenceNr = 3L)), write2.correlationId, instanceId)
 
         evtProbe.expectMsg(("x", e1.vectorTimestamp, timestamp(1, 1), 1L))
         evtProbe.expectMsg(("a", e2.vectorTimestamp, timestamp(2, 1), 2L))

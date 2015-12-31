@@ -64,14 +64,14 @@ private[eventuate] class CassandraEventLogStore(cassandra: Cassandra, logId: Str
     import EventLog._
 
     var currentSequenceNr = math.max(fromSequenceNr, 1L)
-    var currentPartition = partitionOf(currentSequenceNr, partitionSizeMax)
+    var currentPartition = partitionOf(currentSequenceNr, partitionSize)
 
     var currentIter = newIter()
-    var read = currentSequenceNr != firstSequenceNr(currentPartition, partitionSizeMax)
+    var read = currentSequenceNr != firstSequenceNr(currentPartition, partitionSize)
 
     def newIter(): Iterator[Row] =
       if (currentSequenceNr > toSequenceNr) Iterator.empty else {
-        val upperSequenceNumber = lastSequenceNr(currentPartition, partitionSizeMax) min toSequenceNr
+        val upperSequenceNumber = lastSequenceNr(currentPartition, partitionSize) min toSequenceNr
         cassandra.session.execute(preparedReadEventsStatement.bind(currentPartition: JLong, currentSequenceNr: JLong, upperSequenceNumber: JLong)).iterator.asScala
       }
 
@@ -82,7 +82,7 @@ private[eventuate] class CassandraEventLogStore(cassandra: Cassandra, logId: Str
       } else if (read) {
         // some events read from current partition, try next partition
         currentPartition += 1
-        currentSequenceNr = firstSequenceNr(currentPartition, partitionSizeMax)
+        currentSequenceNr = firstSequenceNr(currentPartition, partitionSize)
         currentIter = newIter()
         read = false
         hasNext

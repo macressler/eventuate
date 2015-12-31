@@ -183,7 +183,9 @@ object ReplicationProtocol {
    * Instructs a target log to write replicated `events` from the source log identified by
    * `sourceLogId` along with the last read position in the source log (`replicationProgress`).
    */
-  case class ReplicationWrite(events: Seq[DurableEvent], sourceLogId: String, replicationProgress: Long, currentSourceVersionVector: VectorTime, initiator: ActorRef = null) extends DurableEventBatch
+  case class ReplicationWrite(events: Seq[DurableEvent], sourceLogId: String, replicationProgress: Long, currentSourceVersionVector: VectorTime, replyTo: ActorRef = null) extends UpdateableEventBatch[ReplicationWrite] {
+    override def update(events: Seq[DurableEvent]): ReplicationWrite = copy(events = events)
+  }
 
   /**
    * Success reply after a [[ReplicationWrite]].

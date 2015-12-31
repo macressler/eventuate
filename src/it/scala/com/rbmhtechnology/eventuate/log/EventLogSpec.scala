@@ -16,34 +16,29 @@
 
 package com.rbmhtechnology.eventuate.log
 
-
-import akka.util.Timeout
-import com.rbmhtechnology.eventuate.log.EventLogLifecycle.ErrorSequenceNr
-import com.rbmhtechnology.eventuate.log.EventLogLifecycle.IgnoreDeletedSequenceNr
-import com.rbmhtechnology.eventuate.utilities.RestarterActor.restartActor
-import com.rbmhtechnology.eventuate.utilities.{AwaitHelper, timeoutDuration}
-import org.scalatest.concurrent.Eventually
-import org.scalatest.time.Millis
-import org.scalatest.time.Seconds
-import org.scalatest.time.Span
-
-import scala.collection.immutable.Seq
-
 import akka.actor._
 import akka.pattern.ask
 import akka.testkit.{TestProbe, TestKit}
+import akka.util.Timeout
 
 import com.rbmhtechnology.eventuate._
 import com.rbmhtechnology.eventuate.DurableEvent._
 import com.rbmhtechnology.eventuate.EventsourcingProtocol._
 import com.rbmhtechnology.eventuate.ReplicationFilter.NoFilter
 import com.rbmhtechnology.eventuate.ReplicationProtocol._
+import com.rbmhtechnology.eventuate.log.EventLogLifecycle._
 import com.rbmhtechnology.eventuate.log.EventLogLifecycleCassandra.TestFailureSpec
 import com.rbmhtechnology.eventuate.log.cassandra._
+import com.rbmhtechnology.eventuate.utilities.RestarterActor.restartActor
+import com.rbmhtechnology.eventuate.utilities.{AwaitHelper, timeoutDuration}
 
 import com.typesafe.config.{ConfigFactory, Config}
 
 import org.scalatest._
+import org.scalatest.time._
+import org.scalatest.concurrent.Eventually
+
+import scala.collection.immutable.Seq
 
 object EventLogSpec {
   class ProcessIdFilter(processId: String) extends ReplicationFilter {
@@ -60,8 +55,8 @@ object EventLogSpec {
       |
       |eventuate.log.leveldb.dir = target/test-log
       |eventuate.log.leveldb.index-update-limit = 6
-      |eventuate.log.leveldb.deletion-batch-size-max = 2
-      |eventuate.log.leveldb.deletion-retry-delay = 1 ms
+      |eventuate.log.leveldb.deletion-batch-size = 2
+      |eventuate.log.leveldb.deletion-retry-delay = 1ms
       |eventuate.log.cassandra.default-port = 9142
       |eventuate.log.cassandra.index-update-limit = 3
       |eventuate.log.cassandra.init-retry-delay = 1s
@@ -93,14 +88,14 @@ trait EventLogSpecSupport extends WordSpecLike with Matchers with BeforeAndAfter
 
   implicit val system: ActorSystem
 
-  var _requestorProbe: TestProbe = _
+  var _replyToProbe: TestProbe = _
   var _replicatorProbe: TestProbe = _
   var _notificationProbe: TestProbe = _
 
   var _generatedEmittedEvents: Vector[DurableEvent] = Vector.empty
   var _generatedReplicatedEvents: Vector[DurableEvent] = Vector.empty
 
-  def requestorProbe: TestProbe = _requestorProbe
+  def replyToProbe: TestProbe = _replyToProbe
   def replicatorProbe: TestProbe = _replicatorProbe
   def notificationProbe: TestProbe = _notificationProbe
 
@@ -111,7 +106,7 @@ trait EventLogSpecSupport extends WordSpecLike with Matchers with BeforeAndAfter
   def logId: String
 
   override def beforeEach(): Unit = {
-    _requestorProbe = TestProbe()
+    _replyToProbe = TestProbe()
     _replicatorProbe = TestProbe()
     _notificationProbe = TestProbe()
   }
@@ -129,8 +124,8 @@ trait EventLogSpecSupport extends WordSpecLike with Matchers with BeforeAndAfter
   }
 
   def currentSequenceNr: Long = {
-    log.tell(GetEventLogClock, requestorProbe.ref)
-    requestorProbe.expectMsgClass(classOf[GetEventLogClockSuccess]).clock.sequenceNr
+    log.tell(GetEventLogClock, replyToProbe.ref)
+    replyToProbe.expectMsgClass(classOf[GetEventLogClockSuccess]).clock.sequenceNr
   }
 
   def expectedEmittedEvents(events: Seq[DurableEvent], offset: Long = 0): Seq[DurableEvent] =
@@ -146,8 +141,8 @@ trait EventLogSpecSupport extends WordSpecLike with Matchers with BeforeAndAfter
   def writeEmittedEvents(events: Seq[DurableEvent], log: ActorRef = log): Seq[DurableEvent] = {
     val offset = currentSequenceNr + 1L
     val expected = expectedEmittedEvents(events, offset)
-    log ! Write(events, system.deadLetters, requestorProbe.ref, 0)
-    expected.foreach(event => requestorProbe.expectMsg(WriteSuccess(event, 0)))
+    log ! Write(events, system.deadLetters, replyToProbe.ref, 0, 0)
+    replyToProbe.expectMsg(WriteSuccess(expected, 0, 0))
     expected
   }
 
@@ -170,17 +165,16 @@ trait EventLogSpecSupport extends WordSpecLike with Matchers with BeforeAndAfter
     collaborator
   }
 
-  def generateEmittedEvents(emitterAggregateId: Option[String] = None, customDestinationAggregateIds: Set[String] = Set(), n: Int = 3): Unit = {
-    _generatedEmittedEvents ++= writeEmittedEvents((0 until n).map { i =>
-        DurableEvent(('a' + i).toChar.toString, emitterIdA, emitterAggregateId, customDestinationAggregateIds)
+  def generateEmittedEvents(emitterAggregateId: Option[String] = None, customDestinationAggregateIds: Set[String] = Set(), num: Int = 3): Unit = {
+    _generatedEmittedEvents ++= writeEmittedEvents((1 to num).map { i =>
+        DurableEvent(s"a-$i", emitterIdA, emitterAggregateId, customDestinationAggregateIds)
     })
   }
 
-  def generateReplicatedEvents(emitterAggregateId: Option[String] = None, customDestinationAggregateIds: Set[String] = Set()): Unit = {
-    _generatedReplicatedEvents ++= writeReplicatedEvents(Vector(
-      DurableEvent("i", emitterIdB, emitterAggregateId, customDestinationAggregateIds, 0L, timestamp(0, 7), remoteLogId, remoteLogId, 7),
-      DurableEvent("j", emitterIdB, emitterAggregateId, customDestinationAggregateIds, 0L, timestamp(0, 8), remoteLogId, remoteLogId, 8),
-      DurableEvent("k", emitterIdB, emitterAggregateId, customDestinationAggregateIds, 0L, timestamp(0, 9), remoteLogId, remoteLogId, 9)), 17)
+  def generateReplicatedEvents(emitterAggregateId: Option[String] = None, customDestinationAggregateIds: Set[String] = Set(), num: Int = 3): Unit = {
+    _generatedReplicatedEvents ++= writeReplicatedEvents((1 to num).map { i =>
+      DurableEvent(s"b-$i", emitterIdB, emitterAggregateId, customDestinationAggregateIds, 0L, timestamp(0, i + 6), remoteLogId, remoteLogId, i + 6)
+    }, 17)
   }
 }
 
@@ -193,7 +187,7 @@ abstract class EventLogSpec extends TestKit(ActorSystem("test", EventLogSpec.con
   override implicit def patienceConfig = PatienceConfig(Span(10, Seconds), Span(100, Millis))
 
   "An event log" must {
-    "write local events and send them to the requestor" in {
+    "write local events" in {
       generateEmittedEvents()
       generateEmittedEvents()
     }
@@ -279,9 +273,8 @@ abstract class EventLogSpec extends TestKit(ActorSystem("test", EventLogSpec.con
         DurableEvent("boom", emitterIdA),
         DurableEvent("okay", emitterIdA))
 
-      log ! Write(events, system.deadLetters, requestorProbe.ref, 0)
-      requestorProbe.expectMsg(WriteFailure(events(0), boom, 0))
-      requestorProbe.expectMsg(WriteFailure(events(1), boom, 0))
+      log ! Write(events, system.deadLetters, replyToProbe.ref, 0, 0)
+      replyToProbe.expectMsg(WriteFailure(events, boom, 0, 0))
     }
     "write replicated events" in {
       generateReplicatedEvents()
@@ -364,11 +357,11 @@ abstract class EventLogSpec extends TestKit(ActorSystem("test", EventLogSpec.con
       collaborator.expectMsg(Written(generatedReplicatedEvents(2)))
     }
     "write replicated events and update the replication progress map" in {
-      log.tell(GetReplicationProgresses, requestorProbe.ref)
-      requestorProbe.expectMsg(GetReplicationProgressesSuccess(Map()))
+      log.tell(GetReplicationProgresses, replyToProbe.ref)
+      replyToProbe.expectMsg(GetReplicationProgressesSuccess(Map()))
       generateReplicatedEvents()
-      log.tell(GetReplicationProgresses, requestorProbe.ref)
-      requestorProbe.expectMsg(GetReplicationProgressesSuccess(Map(remoteLogId -> 17L)))
+      log.tell(GetReplicationProgresses, replyToProbe.ref)
+      replyToProbe.expectMsg(GetReplicationProgressesSuccess(Map(remoteLogId -> 17L)))
     }
     "reply with a failure message if replication fails" in {
       val events: Vector[DurableEvent] = Vector(
@@ -379,267 +372,266 @@ abstract class EventLogSpec extends TestKit(ActorSystem("test", EventLogSpec.con
       replicatorProbe.expectMsg(ReplicationWriteFailure(boom))
     }
     "reply with a failure message if replication fails and not update the replication progress map" in {
-      log.tell(GetReplicationProgresses, requestorProbe.ref)
-      requestorProbe.expectMsg(GetReplicationProgressesSuccess(Map()))
+      log.tell(GetReplicationProgresses, replyToProbe.ref)
+      replyToProbe.expectMsg(GetReplicationProgressesSuccess(Map()))
       val events: Vector[DurableEvent] = Vector(
         DurableEvent("boom", emitterIdB, None, Set(), 0L, timestamp(0, 7), remoteLogId, remoteLogId, 7),
         DurableEvent("okay", emitterIdB, None, Set(), 0L, timestamp(0, 8), remoteLogId, remoteLogId, 8))
 
       log.tell(ReplicationWrite(events, remoteLogId, 8, VectorTime()), replicatorProbe.ref)
       replicatorProbe.expectMsg(ReplicationWriteFailure(boom))
-      log.tell(GetReplicationProgresses, requestorProbe.ref)
-      requestorProbe.expectMsg(GetReplicationProgressesSuccess(Map()))
+      log.tell(GetReplicationProgresses, replyToProbe.ref)
+      replyToProbe.expectMsg(GetReplicationProgressesSuccess(Map()))
     }
     "replay events from scratch" in {
       generateEmittedEvents()
-      log ! Replay(1L, requestorProbe.ref, 0)
-      requestorProbe.expectMsg(Replaying(generatedEmittedEvents(0), 0))
-      requestorProbe.expectMsg(Replaying(generatedEmittedEvents(1), 0))
-      requestorProbe.expectMsg(Replaying(generatedEmittedEvents(2), 0))
-      requestorProbe.expectMsg(ReplaySuccess(0))
+      log ! Replay(1L, replyToProbe.ref, 0)
+      replyToProbe.expectMsg(Replaying(generatedEmittedEvents(0), 0))
+      replyToProbe.expectMsg(Replaying(generatedEmittedEvents(1), 0))
+      replyToProbe.expectMsg(Replaying(generatedEmittedEvents(2), 0))
+      replyToProbe.expectMsg(ReplaySuccess(0))
     }
-    "replay events in chunks" in {
+    "replay events in batches" in {
       generateEmittedEvents()
       generateEmittedEvents()
-      log ! Replay(1L, 2, requestorProbe.ref, 0)
-      requestorProbe.expectMsg(Replaying(generatedEmittedEvents(0), 0))
-      requestorProbe.expectMsg(Replaying(generatedEmittedEvents(1), 0))
-      requestorProbe.expectMsg(ReplaySuspended(0))
-      requestorProbe.sender() ! ReplayNext(2, 0)
-      requestorProbe.expectMsg(Replaying(generatedEmittedEvents(2), 0))
-      requestorProbe.expectMsg(Replaying(generatedEmittedEvents(3), 0))
-      requestorProbe.expectMsg(ReplaySuspended(0))
-      requestorProbe.sender() ! ReplayNext(2, 0)
-      requestorProbe.expectMsg(Replaying(generatedEmittedEvents(4), 0))
-      requestorProbe.expectMsg(Replaying(generatedEmittedEvents(5), 0))
-      requestorProbe.expectMsg(ReplaySuccess(0))
+      log ! Replay(1L, 2, replyToProbe.ref, 0)
+      replyToProbe.expectMsg(Replaying(generatedEmittedEvents(0), 0))
+      replyToProbe.expectMsg(Replaying(generatedEmittedEvents(1), 0))
+      replyToProbe.expectMsg(ReplaySuspended(0))
+      replyToProbe.sender() ! ReplayNext(2, 0)
+      replyToProbe.expectMsg(Replaying(generatedEmittedEvents(2), 0))
+      replyToProbe.expectMsg(Replaying(generatedEmittedEvents(3), 0))
+      replyToProbe.expectMsg(ReplaySuspended(0))
+      replyToProbe.sender() ! ReplayNext(2, 0)
+      replyToProbe.expectMsg(Replaying(generatedEmittedEvents(4), 0))
+      replyToProbe.expectMsg(Replaying(generatedEmittedEvents(5), 0))
+      replyToProbe.expectMsg(ReplaySuccess(0))
     }
     "replay events from a custom position" in {
       generateEmittedEvents()
-      log ! Replay(3L, requestorProbe.ref, 0)
-      requestorProbe.expectMsg(Replaying(generatedEmittedEvents(2), 0))
-      requestorProbe.expectMsg(ReplaySuccess(0))
+      log ! Replay(3L, replyToProbe.ref, 0)
+      replyToProbe.expectMsg(Replaying(generatedEmittedEvents(2), 0))
+      replyToProbe.expectMsg(ReplaySuccess(0))
       // custom position > last sequence number
-      log ! Replay(5L, requestorProbe.ref, 0)
-      requestorProbe.expectMsg(ReplaySuccess(0))
+      log ! Replay(5L, replyToProbe.ref, 0)
+      replyToProbe.expectMsg(ReplaySuccess(0))
     }
     "replay events from the default log if request aggregateId is not defined" in {
       generateEmittedEvents(customDestinationAggregateIds = Set("a1"))
-      log ! Replay(1L, requestorProbe.ref, None, 0)
-      requestorProbe.expectMsg(Replaying(generatedEmittedEvents(0), 0))
-      requestorProbe.expectMsg(Replaying(generatedEmittedEvents(1), 0))
-      requestorProbe.expectMsg(Replaying(generatedEmittedEvents(2), 0))
-      requestorProbe.expectMsg(ReplaySuccess(0))
+      log ! Replay(1L, replyToProbe.ref, None, 0)
+      replyToProbe.expectMsg(Replaying(generatedEmittedEvents(0), 0))
+      replyToProbe.expectMsg(Replaying(generatedEmittedEvents(1), 0))
+      replyToProbe.expectMsg(Replaying(generatedEmittedEvents(2), 0))
+      replyToProbe.expectMsg(ReplaySuccess(0))
     }
     "replay events from the index if request aggregateId is defined" in {
       generateEmittedEvents(customDestinationAggregateIds = Set("a1"))
-      log ! Replay(1L, requestorProbe.ref, Some("a1"), 0)
-      requestorProbe.expectMsg(Replaying(generatedEmittedEvents(0), 0))
-      requestorProbe.expectMsg(Replaying(generatedEmittedEvents(1), 0))
-      requestorProbe.expectMsg(Replaying(generatedEmittedEvents(2), 0))
-      requestorProbe.expectMsg(ReplaySuccess(0))
+      log ! Replay(1L, replyToProbe.ref, Some("a1"), 0)
+      replyToProbe.expectMsg(Replaying(generatedEmittedEvents(0), 0))
+      replyToProbe.expectMsg(Replaying(generatedEmittedEvents(1), 0))
+      replyToProbe.expectMsg(Replaying(generatedEmittedEvents(2), 0))
+      replyToProbe.expectMsg(ReplaySuccess(0))
     }
     "replay events from the index with proper isolation" in {
       generateEmittedEvents(customDestinationAggregateIds = Set("a1"))
       generateEmittedEvents(customDestinationAggregateIds = Set("a2"))
-      log ! Replay(1L, requestorProbe.ref, Some("a1"), 0)
-      requestorProbe.expectMsg(Replaying(generatedEmittedEvents(0), 0))
-      requestorProbe.expectMsg(Replaying(generatedEmittedEvents(1), 0))
-      requestorProbe.expectMsg(Replaying(generatedEmittedEvents(2), 0))
-      requestorProbe.expectMsg(ReplaySuccess(0))
+      log ! Replay(1L, replyToProbe.ref, Some("a1"), 0)
+      replyToProbe.expectMsg(Replaying(generatedEmittedEvents(0), 0))
+      replyToProbe.expectMsg(Replaying(generatedEmittedEvents(1), 0))
+      replyToProbe.expectMsg(Replaying(generatedEmittedEvents(2), 0))
+      replyToProbe.expectMsg(ReplaySuccess(0))
     }
     "replay events from the index and from a custom position" in {
       generateEmittedEvents(customDestinationAggregateIds = Set("a1"))
       generateEmittedEvents(customDestinationAggregateIds = Set("a2"))
-      log ! Replay(2L, requestorProbe.ref, Some("a1"), 0)
-      requestorProbe.expectMsg(Replaying(generatedEmittedEvents(1), 0))
-      requestorProbe.expectMsg(Replaying(generatedEmittedEvents(2), 0))
-      requestorProbe.expectMsg(ReplaySuccess(0))
-      log ! Replay(5L, requestorProbe.ref, Some("a1"), 0)
-      requestorProbe.expectMsg(ReplaySuccess(0))
-      log ! Replay(2L, requestorProbe.ref, Some("a2"), 0)
-      requestorProbe.expectMsg(Replaying(generatedEmittedEvents(3), 0))
-      requestorProbe.expectMsg(Replaying(generatedEmittedEvents(4), 0))
-      requestorProbe.expectMsg(Replaying(generatedEmittedEvents(5), 0))
-      requestorProbe.expectMsg(ReplaySuccess(0))
-      log ! Replay(5L, requestorProbe.ref, Some("a2"), 0)
-      requestorProbe.expectMsg(Replaying(generatedEmittedEvents(4), 0))
-      requestorProbe.expectMsg(Replaying(generatedEmittedEvents(5), 0))
-      requestorProbe.expectMsg(ReplaySuccess(0))
+      log ! Replay(2L, replyToProbe.ref, Some("a1"), 0)
+      replyToProbe.expectMsg(Replaying(generatedEmittedEvents(1), 0))
+      replyToProbe.expectMsg(Replaying(generatedEmittedEvents(2), 0))
+      replyToProbe.expectMsg(ReplaySuccess(0))
+      log ! Replay(5L, replyToProbe.ref, Some("a1"), 0)
+      replyToProbe.expectMsg(ReplaySuccess(0))
+      log ! Replay(2L, replyToProbe.ref, Some("a2"), 0)
+      replyToProbe.expectMsg(Replaying(generatedEmittedEvents(3), 0))
+      replyToProbe.expectMsg(Replaying(generatedEmittedEvents(4), 0))
+      replyToProbe.expectMsg(Replaying(generatedEmittedEvents(5), 0))
+      replyToProbe.expectMsg(ReplaySuccess(0))
+      log ! Replay(5L, replyToProbe.ref, Some("a2"), 0)
+      replyToProbe.expectMsg(Replaying(generatedEmittedEvents(4), 0))
+      replyToProbe.expectMsg(Replaying(generatedEmittedEvents(5), 0))
+      replyToProbe.expectMsg(ReplaySuccess(0))
     }
     "not replay events with non-matching aggregateId if request aggregateId is defined" in {
       generateEmittedEvents(customDestinationAggregateIds = Set("a1"))
-      log ! Replay(1L, requestorProbe.ref, Some("a2"), 0)
-      requestorProbe.expectMsg(ReplaySuccess(0))
+      log ! Replay(1L, replyToProbe.ref, Some("a2"), 0)
+      replyToProbe.expectMsg(ReplaySuccess(0))
     }
     "reply with a failure message if replay fails" in {
-      log ! Replay(ErrorSequenceNr, requestorProbe.ref, 0)
-      requestorProbe.expectMsg(ReplayFailure(boom, 0))
+      log ! Replay(ErrorSequenceNr, replyToProbe.ref, 0)
+      replyToProbe.expectMsg(ReplayFailure(boom, 0))
     }
     "batch-read local events" in {
       generateEmittedEvents()
-      log.tell(ReplicationRead(1, Int.MaxValue, NoFilter, UndefinedLogId, dl, VectorTime()), requestorProbe.ref)
-      requestorProbe.expectMsg(ReplicationReadSuccess(generatedEmittedEvents, 3, UndefinedLogId, VectorTime(logId -> 3L)))
+      log.tell(ReplicationRead(1, Int.MaxValue, NoFilter, UndefinedLogId, dl, VectorTime()), replyToProbe.ref)
+      replyToProbe.expectMsg(ReplicationReadSuccess(generatedEmittedEvents, 3, UndefinedLogId, VectorTime(logId -> 3L)))
     }
     "batch-read local and replicated events" in {
       generateEmittedEvents()
       generateReplicatedEvents()
-      log.tell(ReplicationRead(1, Int.MaxValue, NoFilter, UndefinedLogId, dl, VectorTime()), requestorProbe.ref)
-      requestorProbe.expectMsg(ReplicationReadSuccess(generatedEmittedEvents ++ generatedReplicatedEvents, 6, UndefinedLogId, VectorTime(logId -> 3L, remoteLogId -> 9L)))
+      log.tell(ReplicationRead(1, Int.MaxValue, NoFilter, UndefinedLogId, dl, VectorTime()), replyToProbe.ref)
+      replyToProbe.expectMsg(ReplicationReadSuccess(generatedEmittedEvents ++ generatedReplicatedEvents, 6, UndefinedLogId, VectorTime(logId -> 3L, remoteLogId -> 9L)))
     }
     "batch-read events with a batch size limit" in {
       generateEmittedEvents()
-      log.tell(ReplicationRead(1, 2, NoFilter, UndefinedLogId, dl, VectorTime()), requestorProbe.ref)
-      requestorProbe.expectMsg(ReplicationReadSuccess(generatedEmittedEvents.take(2), 2, UndefinedLogId, VectorTime(logId -> 3L)))
-      log.tell(ReplicationRead(1, 0, NoFilter, UndefinedLogId, dl, VectorTime()), requestorProbe.ref)
-      requestorProbe.expectMsg(ReplicationReadSuccess(Nil, 0, UndefinedLogId, VectorTime(logId -> 3L)))
+      log.tell(ReplicationRead(1, 2, NoFilter, UndefinedLogId, dl, VectorTime()), replyToProbe.ref)
+      replyToProbe.expectMsg(ReplicationReadSuccess(generatedEmittedEvents.take(2), 2, UndefinedLogId, VectorTime(logId -> 3L)))
+      log.tell(ReplicationRead(1, 0, NoFilter, UndefinedLogId, dl, VectorTime()), replyToProbe.ref)
+      replyToProbe.expectMsg(ReplicationReadSuccess(Nil, 0, UndefinedLogId, VectorTime(logId -> 3L)))
     }
     "batch-read events from a custom position" in {
       generateEmittedEvents()
-      log.tell(ReplicationRead(2, Int.MaxValue, NoFilter, UndefinedLogId, dl, VectorTime()), requestorProbe.ref)
-      requestorProbe.expectMsg(ReplicationReadSuccess(generatedEmittedEvents.drop(1), 3, UndefinedLogId, VectorTime(logId -> 3L)))
+      log.tell(ReplicationRead(2, Int.MaxValue, NoFilter, UndefinedLogId, dl, VectorTime()), replyToProbe.ref)
+      replyToProbe.expectMsg(ReplicationReadSuccess(generatedEmittedEvents.drop(1), 3, UndefinedLogId, VectorTime(logId -> 3L)))
     }
     "batch-read events from a custom position with a batch size limit" in {
       generateEmittedEvents()
-      log.tell(ReplicationRead(2, 1, NoFilter, UndefinedLogId, dl, VectorTime()), requestorProbe.ref)
-      requestorProbe.expectMsg(ReplicationReadSuccess(generatedEmittedEvents.drop(1).take(1), 2, UndefinedLogId, VectorTime(logId -> 3L)))
+      log.tell(ReplicationRead(2, 1, NoFilter, UndefinedLogId, dl, VectorTime()), replyToProbe.ref)
+      replyToProbe.expectMsg(ReplicationReadSuccess(generatedEmittedEvents.drop(1).take(1), 2, UndefinedLogId, VectorTime(logId -> 3L)))
     }
     "batch-read events with exclusion" in {
       generateEmittedEvents()
       generateReplicatedEvents()
-      log.tell(ReplicationRead(1, Int.MaxValue, new ProcessIdFilter(remoteLogId), UndefinedLogId, dl, VectorTime()), requestorProbe.ref)
-      requestorProbe.expectMsg(ReplicationReadSuccess(generatedReplicatedEvents, 6, UndefinedLogId, VectorTime(logId -> 3L, remoteLogId -> 9L)))
-      log.tell(ReplicationRead(1, Int.MaxValue, new ProcessIdFilter(logId), UndefinedLogId, dl, VectorTime()), requestorProbe.ref)
-      requestorProbe.expectMsg(ReplicationReadSuccess(generatedEmittedEvents, 6, UndefinedLogId, VectorTime(logId -> 3L, remoteLogId -> 9L)))
+      log.tell(ReplicationRead(1, Int.MaxValue, new ProcessIdFilter(remoteLogId), UndefinedLogId, dl, VectorTime()), replyToProbe.ref)
+      replyToProbe.expectMsg(ReplicationReadSuccess(generatedReplicatedEvents, 6, UndefinedLogId, VectorTime(logId -> 3L, remoteLogId -> 9L)))
+      log.tell(ReplicationRead(1, Int.MaxValue, new ProcessIdFilter(logId), UndefinedLogId, dl, VectorTime()), replyToProbe.ref)
+      replyToProbe.expectMsg(ReplicationReadSuccess(generatedEmittedEvents, 6, UndefinedLogId, VectorTime(logId -> 3L, remoteLogId -> 9L)))
     }
     "not batch-read events from index" in {
       generateEmittedEvents(customDestinationAggregateIds = Set("a1"))
       generateEmittedEvents(customDestinationAggregateIds = Set())
-      log.tell(ReplicationRead(1, Int.MaxValue, NoFilter, UndefinedLogId, dl, VectorTime()), requestorProbe.ref)
-      requestorProbe.expectMsg(ReplicationReadSuccess(generatedEmittedEvents, 6, UndefinedLogId, VectorTime(logId -> 6L)))
+      log.tell(ReplicationRead(1, Int.MaxValue, NoFilter, UndefinedLogId, dl, VectorTime()), replyToProbe.ref)
+      replyToProbe.expectMsg(ReplicationReadSuccess(generatedEmittedEvents, 6, UndefinedLogId, VectorTime(logId -> 6L)))
     }
     "reply with a failure message if batch-read fails" in {
-      log.tell(ReplicationRead(ErrorSequenceNr, Int.MaxValue, NoFilter, UndefinedLogId, dl, VectorTime()), requestorProbe.ref)
-      requestorProbe.expectMsg(ReplicationReadFailure(boom.getMessage, UndefinedLogId))
+      log.tell(ReplicationRead(ErrorSequenceNr, Int.MaxValue, NoFilter, UndefinedLogId, dl, VectorTime()), replyToProbe.ref)
+      replyToProbe.expectMsg(ReplicationReadFailure(boom.getMessage, UndefinedLogId))
     }
     "recover the current sequence number on (re)start" in {
       generateEmittedEvents()
-      log.tell(GetEventLogClock, requestorProbe.ref)
-      requestorProbe.expectMsgType[GetEventLogClockSuccess].clock.sequenceNr should be(3L)
+      log.tell(GetEventLogClock, replyToProbe.ref)
+      replyToProbe.expectMsgType[GetEventLogClockSuccess].clock.sequenceNr should be(3L)
       log ! "boom"
-      log.tell(GetEventLogClock, requestorProbe.ref)
-      requestorProbe.expectMsgType[GetEventLogClockSuccess].clock.sequenceNr should be(3L)
+      log.tell(GetEventLogClock, replyToProbe.ref)
+      replyToProbe.expectMsgType[GetEventLogClockSuccess].clock.sequenceNr should be(3L)
     }
     "recover the replication progress on (re)start" in {
-      log.tell(SetReplicationProgress("x", 17), requestorProbe.ref)
-      requestorProbe.expectMsg(SetReplicationProgressSuccess("x", 17))
-      log.tell(SetReplicationProgress("y", 19), requestorProbe.ref)
-      requestorProbe.expectMsg(SetReplicationProgressSuccess("y", 19))
-      log.tell(GetReplicationProgresses, requestorProbe.ref)
-      requestorProbe.expectMsg(GetReplicationProgressesSuccess(Map("x" -> 17, "y" -> 19)))
+      log.tell(SetReplicationProgress("x", 17), replyToProbe.ref)
+      replyToProbe.expectMsg(SetReplicationProgressSuccess("x", 17))
+      log.tell(SetReplicationProgress("y", 19), replyToProbe.ref)
+      replyToProbe.expectMsg(SetReplicationProgressSuccess("y", 19))
+      log.tell(GetReplicationProgresses, replyToProbe.ref)
+      replyToProbe.expectMsg(GetReplicationProgressesSuccess(Map("x" -> 17, "y" -> 19)))
       log ! "boom"
-      log.tell(GetReplicationProgresses, requestorProbe.ref)
-      requestorProbe.expectMsg(GetReplicationProgressesSuccess(Map("x" -> 17, "y" -> 19)))
+      log.tell(GetReplicationProgresses, replyToProbe.ref)
+      replyToProbe.expectMsg(GetReplicationProgressesSuccess(Map("x" -> 17, "y" -> 19)))
     }
     "update the replication progress if last read sequence nr > last replicated sequence nr" in {
-      log.tell(GetReplicationProgresses, requestorProbe.ref)
-      requestorProbe.expectMsg(GetReplicationProgressesSuccess(Map()))
+      log.tell(GetReplicationProgresses, replyToProbe.ref)
+      replyToProbe.expectMsg(GetReplicationProgressesSuccess(Map()))
       writeReplicationProgress(19, 19)
-      log.tell(GetReplicationProgresses, requestorProbe.ref)
-      requestorProbe.expectMsg(GetReplicationProgressesSuccess(Map(EventLogSpec.remoteLogId -> 19L)))
+      log.tell(GetReplicationProgresses, replyToProbe.ref)
+      replyToProbe.expectMsg(GetReplicationProgressesSuccess(Map(EventLogSpec.remoteLogId -> 19L)))
     }
     "update an event's system timestamp" in {
-      log ! Write(List(event("a").copy(systemTimestamp = 3L)), system.deadLetters, requestorProbe.ref, 0)
-      requestorProbe.expectMsgType[WriteSuccess].event.systemTimestamp should be(0L)
+      log ! Write(List(event("a").copy(systemTimestamp = 3L)), system.deadLetters, replyToProbe.ref, 0, 0)
+      replyToProbe.expectMsgType[WriteSuccess].events.head.systemTimestamp should be(0L)
     }
     "update an emitted event's process id and vector timestamp during if the process id is not defined" in {
       val evt = DurableEvent("a", emitterIdA, processId = UndefinedLogId)
       val exp = DurableEvent("a", emitterIdA, processId = logId, vectorTimestamp = VectorTime(logId -> 1L), localLogId = logId, localSequenceNr = 1)
-      log ! Write(List(evt), system.deadLetters, requestorProbe.ref, 0)
-      requestorProbe.expectMsgType[WriteSuccess].event should be(exp)
+      log ! Write(List(evt), system.deadLetters, replyToProbe.ref, 0, 0)
+      replyToProbe.expectMsgType[WriteSuccess].events.head should be(exp)
     }
     "not update an emitted event's process id and vector timestamp during if the process id is defined" in {
       val evt = DurableEvent("a", emitterIdA, processId = emitterIdA, vectorTimestamp = VectorTime(emitterIdA -> 1L))
       val exp = DurableEvent("a", emitterIdA, processId = emitterIdA, vectorTimestamp = VectorTime(emitterIdA -> 1L), localLogId = logId, localSequenceNr = 1)
-      log ! Write(List(evt), system.deadLetters, requestorProbe.ref, 0)
-      requestorProbe.expectMsgType[WriteSuccess].event should be(exp)
+      log ! Write(List(evt), system.deadLetters, replyToProbe.ref, 0, 0)
+      replyToProbe.expectMsgType[WriteSuccess].events.head should be(exp)
     }
     "update a replicated event's process id and vector timestamp during if the process id is not defined" in {
       val evt = DurableEvent("a", emitterIdA, processId = UndefinedLogId, vectorTimestamp = VectorTime(remoteLogId -> 1L))
       val exp = DurableEvent("a", emitterIdA, processId = logId, vectorTimestamp = VectorTime(remoteLogId -> 1L, logId -> 1L), localLogId = logId, localSequenceNr = 1)
-      registerCollaborator(aggregateId = None, collaborator = requestorProbe)
+      registerCollaborator(aggregateId = None, collaborator = replyToProbe)
       log ! ReplicationWrite(List(evt), remoteLogId, 5, VectorTime())
-      requestorProbe.expectMsgType[Written].event should be(exp)
+      replyToProbe.expectMsgType[Written].event should be(exp)
     }
     "not update a replicated event's process id and vector timestamp during if the process id is defined" in {
       val evt = DurableEvent("a", emitterIdA, processId = emitterIdA, vectorTimestamp = VectorTime(emitterIdA -> 1L))
       val exp = DurableEvent("a", emitterIdA, processId = emitterIdA, vectorTimestamp = VectorTime(emitterIdA -> 1L), localLogId = logId, localSequenceNr = 1)
-      registerCollaborator(aggregateId = None, collaborator = requestorProbe)
+      registerCollaborator(aggregateId = None, collaborator = replyToProbe)
       log ! ReplicationWrite(List(evt), remoteLogId, 5, VectorTime())
-      requestorProbe.expectMsgType[Written].event should be(exp)
+      replyToProbe.expectMsgType[Written].event should be(exp)
     }
     "not write events to the target log that are in causal past of the target log" in {
       val evt1 = DurableEvent("i", emitterIdB, vectorTimestamp = timestamp(0, 7), processId = remoteLogId)
       val evt2 = DurableEvent("j", emitterIdB, vectorTimestamp = timestamp(0, 8), processId = remoteLogId)
       val evt3 = DurableEvent("k", emitterIdB, vectorTimestamp = timestamp(0, 9), processId = remoteLogId)
-      registerCollaborator(aggregateId = None, collaborator = requestorProbe)
+      registerCollaborator(aggregateId = None, collaborator = replyToProbe)
       log ! ReplicationWrite(List(evt1, evt2), remoteLogId, 5, VectorTime())
       log ! ReplicationWrite(List(evt2, evt3), remoteLogId, 6, VectorTime())
-      requestorProbe.expectMsgType[Written].event.payload should be("i")
-      requestorProbe.expectMsgType[Written].event.payload should be("j")
-      requestorProbe.expectMsgType[Written].event.payload should be("k")
+      replyToProbe.expectMsgType[Written].event.payload should be("i")
+      replyToProbe.expectMsgType[Written].event.payload should be("j")
+      replyToProbe.expectMsgType[Written].event.payload should be("k")
     }
     "not read events from the source log that are in causal past of the target log (using the target time from the request)" in {
       generateEmittedEvents()
-      log.tell(ReplicationRead(1, Int.MaxValue, NoFilter, remoteLogId, dl, timestamp(1)), requestorProbe.ref)
-      requestorProbe.expectMsgType[ReplicationReadSuccess].events.map(_.payload) should be(Seq("b", "c"))
+      log.tell(ReplicationRead(1, Int.MaxValue, NoFilter, remoteLogId, dl, timestamp(1)), replyToProbe.ref)
+      replyToProbe.expectMsgType[ReplicationReadSuccess].events.map(_.payload) should be(Seq("a-2", "a-3"))
     }
     "not read events from the source log that are in causal past of the target log (using the target time from the cache)" in {
       generateEmittedEvents()
       log ! ReplicationWrite(Nil, remoteLogId, 5, timestamp(2)) // update time cache
-      log.tell(ReplicationRead(1, Int.MaxValue, NoFilter, remoteLogId, dl, timestamp(1)), requestorProbe.ref)
-      requestorProbe.expectMsgType[ReplicationReadSuccess].events.map(_.payload) should be(Seq("c"))
+      log.tell(ReplicationRead(1, Int.MaxValue, NoFilter, remoteLogId, dl, timestamp(1)), replyToProbe.ref)
+      replyToProbe.expectMsgType[ReplicationReadSuccess].events.map(_.payload) should be(Seq("a-3"))
     }
     "delete all events when requested sequence nr is higher than current" in {
       generateEmittedEvents()
       (log ? Delete(generatedEmittedEvents(2).localSequenceNr + 1)).await
-      log ! Replay(1, requestorProbe.ref, 0)
-      requestorProbe.expectMsg(ReplaySuccess(0))
+      log ! Replay(1, replyToProbe.ref, 0)
+      replyToProbe.expectMsg(ReplaySuccess(0))
     }
     "not replay deleted events" in {
       generateEmittedEvents()
       (log ? Delete(generatedEmittedEvents(1).localSequenceNr)).await
-      log ! Replay(1, requestorProbe.ref, 0)
-      requestorProbe.expectMsg(Replaying(generatedEmittedEvents(2), 0))
-      requestorProbe.expectMsg(ReplaySuccess(0))
+      log ! Replay(1, replyToProbe.ref, 0)
+      replyToProbe.expectMsg(Replaying(generatedEmittedEvents(2), 0))
+      replyToProbe.expectMsg(ReplaySuccess(0))
     }
     "not replay deleted events from an index" in {
       generateEmittedEvents(customDestinationAggregateIds = Set("a"))
       (log ? Delete(generatedEmittedEvents(1).localSequenceNr)).await
-      log ! Replay(1, requestorProbe.ref, Some("a"), 0)
-      requestorProbe.expectMsg(Replaying(generatedEmittedEvents(2), 0))
-      requestorProbe.expectMsg(ReplaySuccess(0))
+      log ! Replay(1, replyToProbe.ref, Some("a"), 0)
+      replyToProbe.expectMsg(Replaying(generatedEmittedEvents(2), 0))
+      replyToProbe.expectMsg(ReplaySuccess(0))
     }
     "does not delete future events when requested sequence nr is higher than current" in {
       (log ? Delete(10)).await
       generateEmittedEvents()
-      log ! Replay(1, requestorProbe.ref, 0)
-      generatedEmittedEvents.foreach(event => requestorProbe.expectMsg(Replaying(event, 0)))
-      requestorProbe.expectMsg(ReplaySuccess(0))
+      log ! Replay(1, replyToProbe.ref, 0)
+      generatedEmittedEvents.foreach(event => replyToProbe.expectMsg(Replaying(event, 0)))
+      replyToProbe.expectMsg(ReplaySuccess(0))
     }
     "does not mark already deleted events as not deleted" in {
       generateEmittedEvents()
       log ! Delete(generatedEmittedEvents(2).localSequenceNr)
       (log ? Delete(generatedEmittedEvents(1).localSequenceNr)).await
-      log ! Replay(1, requestorProbe.ref, 0)
-      requestorProbe.expectMsg(ReplaySuccess(0))
+      log ! Replay(1, replyToProbe.ref, 0)
+      replyToProbe.expectMsg(ReplaySuccess(0))
     }
   }
 }
 
 
 class EventLogSpecLeveldb extends EventLogSpec with EventLogLifecycleLeveldb {
-
   import EventLogSpec._
 
   "A LeveldbEventLog" must {
@@ -660,8 +652,8 @@ class EventLogSpecLeveldb extends EventLogSpec with EventLogLifecycleLeveldb {
       }
     }
     "actually delete events from the log and an index when overlapping conditional delete and replication requests are sent" in {
-      generateEmittedEvents(customDestinationAggregateIds = Set("a"), n = 50)
-      generateEmittedEvents(n = 50)
+      generateEmittedEvents(customDestinationAggregateIds = Set("a"), num = 50)
+      generateEmittedEvents(num = 50)
       generatedEmittedEvents.foreach { event =>
         (log ? Delete(event.localSequenceNr, Set(remoteLogId))).await
         log ! ReplicationRead((event.localSequenceNr - 10) max 0, Int.MaxValue, NoFilter, remoteLogId, dl, VectorTime())
@@ -702,8 +694,8 @@ class EventLogSpecLeveldb extends EventLogSpec with EventLogLifecycleLeveldb {
     "delete events after successful replication if conditionally deleted" in {
       generateEmittedEvents()
       (log ? Delete(generatedEmittedEvents(1).localSequenceNr, Set(remoteLogId))).await
-      log.tell(ReplicationRead(1, Int.MaxValue, NoFilter, remoteLogId, dl, VectorTime()), requestorProbe.ref)
-      requestorProbe.expectMsg(ReplicationReadSuccess(generatedEmittedEvents, 3, remoteLogId, VectorTime(logId -> 3L)))
+      log.tell(ReplicationRead(1, Int.MaxValue, NoFilter, remoteLogId, dl, VectorTime()), replyToProbe.ref)
+      replyToProbe.expectMsg(ReplicationReadSuccess(generatedEmittedEvents, 3, remoteLogId, VectorTime(logId -> 3L)))
       // indicate that remoteLogId has successfully replicated all events
       log.tell(ReplicationRead(generatedEmittedEvents.last.localSequenceNr + 1, Int.MaxValue, NoFilter, remoteLogId, dl, VectorTime()), ActorRef.noSender)
 
@@ -733,9 +725,9 @@ class EventLogSpecCassandra extends EventLogSpec with EventLogLifecycleCassandra
     expectReplay(1L, aggregateId, payloads: _*)
 
   def expectReplay(fromSequenceNr: Long, aggregateId: Option[String], payloads: String *): Unit = {
-    log ! Replay(fromSequenceNr, requestorProbe.ref, aggregateId, 0)
-    payloads.foreach(payload => requestorProbe.expectMsgClass(classOf[Replaying]).event.payload should be(payload))
-    requestorProbe.expectMsg(ReplaySuccess(0))
+    log ! Replay(fromSequenceNr, replyToProbe.ref, aggregateId, 0)
+    payloads.foreach(payload => replyToProbe.expectMsgClass(classOf[Replaying]).event.payload should be(payload))
+    replyToProbe.expectMsg(ReplaySuccess(0))
   }
 
   "A Cassandra event log" must {
@@ -872,7 +864,7 @@ class EventLogSpecCassandra extends EventLogSpec with EventLogLifecycleCassandra
 
       expectReplay(3L, Some("a1"), "c", "d")
     }
-    "replay aggregate events from index and log in chunks" in {
+    "replay aggregate events from index and log in batches" in {
       writeEmittedEvents(List(
         event("a", Some("a1")),
         event("b", Some("a1")),
@@ -883,22 +875,21 @@ class EventLogSpecCassandra extends EventLogSpec with EventLogLifecycleCassandra
       writeEmittedEvents(List(
         event("d", Some("a1"))))
 
-      log ! Replay(1L, 2, requestorProbe.ref, Some("a1"), 0)
-      requestorProbe.expectMsgClass(classOf[Replaying]).event.payload should be("a")
-      requestorProbe.expectMsgClass(classOf[Replaying]).event.payload should be("b")
-      requestorProbe.expectMsg(ReplaySuspended(0))
-      requestorProbe.sender() ! ReplayNext(2, 0)
-      requestorProbe.expectMsgClass(classOf[Replaying]).event.payload should be("c")
-      requestorProbe.expectMsgClass(classOf[Replaying]).event.payload should be("d")
-      requestorProbe.expectMsg(ReplaySuccess(0))
+      log ! Replay(1L, 2, replyToProbe.ref, Some("a1"), 0)
+      replyToProbe.expectMsgClass(classOf[Replaying]).event.payload should be("a")
+      replyToProbe.expectMsgClass(classOf[Replaying]).event.payload should be("b")
+      replyToProbe.expectMsg(ReplaySuspended(0))
+      replyToProbe.sender() ! ReplayNext(2, 0)
+      replyToProbe.expectMsgClass(classOf[Replaying]).event.payload should be("c")
+      replyToProbe.expectMsgClass(classOf[Replaying]).event.payload should be("d")
+      replyToProbe.expectMsg(ReplaySuccess(0))
     }
     "batch-read deleted (replicated or local) events" in {
       generateEmittedEvents()
       generateReplicatedEvents()
       (log ? Delete(generatedReplicatedEvents(1).localSequenceNr)).await
-      val probe = TestProbe()
-      log.tell(ReplicationRead(1, Int.MaxValue, NoFilter, UndefinedLogId, dl, VectorTime()), probe.ref)
-      probe.expectMsg(ReplicationReadSuccess(generatedEmittedEvents ++ generatedReplicatedEvents, 6, UndefinedLogId, VectorTime(logId -> 3L, remoteLogId -> 9L)))
+      log.tell(ReplicationRead(1, Int.MaxValue, NoFilter, UndefinedLogId, dl, VectorTime()), replyToProbe.ref)
+      replyToProbe.expectMsg(ReplicationReadSuccess(generatedEmittedEvents ++ generatedReplicatedEvents, 6, UndefinedLogId, VectorTime(logId -> 3L, remoteLogId -> 9L)))
     }
   }
 }

@@ -19,7 +19,6 @@ package com.rbmhtechnology.eventuate.log
 import java.io.Closeable
 
 import akka.actor._
-import akka.pattern.pipe
 import akka.dispatch.MessageDispatcher
 import akka.event.LoggingAdapter
 
@@ -44,7 +43,7 @@ trait EventLogSettings {
    * If an event batch doesn't fit into the current partition, it will be written to the next
    * partition, so that batch writes are always single-partition writes.
    */
-  def partitionSizeMax: Long
+  def partitionSize: Long
 
   /**
    * Maximum number of clock recovery retries.
@@ -92,20 +91,21 @@ case class EventLogClock(sequenceNr: Long = 0L, versionVector: VectorTime = Vect
 case class BatchReadResult(events: Seq[DurableEvent], to: Long) extends DurableEventBatch
 
 /**
+ * View of a [[EventsourcingProtocol.Delete Delete]] request.
+ *
  * @param toSequenceNr A marker that indicates that all event with a smaller sequence nr are not replayed any more.
- * @param remoteLogIds A set of remote log ids that must have replicated events before they are allowed to be physically deleted.
+ * @param remoteLogIds A set of remote log ids that must have replicated events before they these events are allowed
+ *                     to be physically deleted locally.
  */
 case class DeletionMetadata(toSequenceNr: Long, remoteLogIds: Set[String])
 
 /**
  * Indicates that a storage backend doesn't support physical deletion of events.
  */
-class PhysicalDeletionNotSupportedException extends UnsupportedOperationException
+private class PhysicalDeletionNotSupportedException extends UnsupportedOperationException
 
 /**
  * Event log storage provider interface (SPI).
- *
- * '''Please note:''' This interface is preliminary and likely to be changed in future versions.
  *
  * @tparam A Event iterator factory parameter type (see [[eventIterator]] factory method).
  */
@@ -132,13 +132,15 @@ trait EventLogSPI[A] { this: Actor =>
 
   /**
    * Asynchronously reads all stored local replication progresses.
-   * @see GetReplicationProgresses
+   *
+   * @see [[GetReplicationProgresses]]
    */
   def readReplicationProgresses: Future[Map[String, Long]]
 
   /**
    * Asynchronously reads the replication progress for given source `logId`.
-   * @see GetReplicationProgress
+   *
+   * @see [[GetReplicationProgress]]
    */
   def readReplicationProgress(logId: String): Future[Long]
 
@@ -195,25 +197,23 @@ trait EventLogSPI[A] { this: Actor =>
   def write(events: Seq[DurableEvent], partition: Long, clock: EventLogClock): Unit
 
   /**
-   * Store metadata regarding a [[Delete]] request. This
-   * marks events upto [[DeletionMetadata.toSequenceNr]] as deleted, i.e. they are not read on replay
-   * and indicates which remote logs must have replicated events before they are allowed to be physically deleted
+   * Return the current [[DeletionMetadata]]
+   */
+  def readDeletionMetadata: Future[DeletionMetadata]
+
+  /**
+   * Synchronously writes metadata for a [[EventsourcingProtocol.Delete Delete]] request. This marks events up to
+   * [[DeletionMetadata.toSequenceNr]] as deleted, i.e. they are not read on replay and indicates which remote logs
+   * must have replicated these events before they are allowed to be physically deleted locally.
    */
   def writeDeletionMetadata(data: DeletionMetadata): Unit
 
   /**
-   * A backend that supports physical deletion of event starts asynchronous deletion process
-   * to actually delete events up to [[DeletionMetadata.toSequenceNr]].
-   * @return A [[Future]] that completes when the deletion process is finished. A
-   *         backend that does not support physical deletion returns a failed [[Future]] containing
-   *         a [[PhysicalDeletionNotSupportedException]].
+   * Asynchronously and physically deletes events up to `toSequenceNr`. This operation completes when
+   * physical deletion completed. A backend that does not support physical deletion should not override
+   * this method.
    */
-  def deleteAsync(sequenceNr: Long): Future[Unit] = Future.failed(new PhysicalDeletionNotSupportedException)
-
-  /**
-   * Return the current [[DeletionMetadata]]
-   */
-  def readDeletionMetadata: Future[DeletionMetadata]
+  def delete(toSequenceNr: Long): Future[Unit] = Future.failed(new PhysicalDeletionNotSupportedException)
 }
 
 /**
@@ -352,29 +352,24 @@ abstract class EventLog[A](id: String) extends Actor with EventLogSPI[A] with St
         case Success(_) => sdr ! SetReplicationProgressSuccess(sourceLogId, progress)
         case Failure(e) => sdr ! SetReplicationProgressFailure(e)
       }
-    case Replay(fromSequenceNr, max, requestor, Some(emitterAggregateId), iid) =>
+    case Replay(fromSequenceNr, max, replyTo, Some(emitterAggregateId), iid) =>
       val adjustedFromSequenceNr = adjustFromSequenceNr(fromSequenceNr)
       val iteratorSettings = eventIteratorParameters(adjustedFromSequenceNr, clock.sequenceNr, emitterAggregateId) // avoid async evaluation
-      registry = registry.registerAggregateSubscriber(context.watch(requestor), emitterAggregateId)
-      replayer(requestor, eventIterator(iteratorSettings), adjustedFromSequenceNr) ! ReplayNext(max, iid)
-    case Replay(fromSequenceNr, max, requestor, None, iid) =>
+      registry = registry.registerAggregateSubscriber(context.watch(replyTo), emitterAggregateId)
+      replayer(replyTo, eventIterator(iteratorSettings), adjustedFromSequenceNr) ! ReplayNext(max, iid)
+    case Replay(fromSequenceNr, max, replyTo, None, iid) =>
       val adjustedFromSequenceNr = adjustFromSequenceNr(fromSequenceNr)
       val iteratorSettings = eventIteratorParameters(adjustedFromSequenceNr, clock.sequenceNr) // avoid async evaluation
-      registry = registry.registerDefaultSubscriber(context.watch(requestor))
-      replayer(requestor, eventIterator(iteratorSettings), adjustedFromSequenceNr) ! ReplayNext(max, iid)
+      registry = registry.registerDefaultSubscriber(context.watch(replyTo))
+      replayer(replyTo, eventIterator(iteratorSettings), adjustedFromSequenceNr) ! ReplayNext(max, iid)
     case r @ ReplicationRead(from, max, filter, targetLogId, _, currentTargetVersionVector) =>
       import services.readDispatcher
       val sdr = sender()
       channel.foreach(_ ! r)
       remoteReplicationProgress += targetLogId -> (0L max from - 1)
       read(from, clock.sequenceNr, max, evt => evt.replicable(currentTargetVersionVector, filter)) onComplete {
-        case Success(BatchReadResult(events, progress)) =>
-          val reply = ReplicationReadSuccess(events, progress, targetLogId, null)
-          self.tell(reply, sdr)
-        case Failure(cause) =>
-          val reply = ReplicationReadFailure(cause.getMessage, targetLogId)
-          sdr ! reply
-          channel.foreach(_ ! reply)
+        case Success(r) => self.tell(ReplicationReadSuccess(r.events, r.to, targetLogId, null), sdr)
+        case Failure(e) => self.tell(ReplicationReadFailure(e.getMessage, targetLogId), sdr)
       }
     case r @ ReplicationReadSuccess(events, _, targetLogId, _) =>
       // Post-exclude events using a possibly updated version vector received from the
@@ -387,13 +382,16 @@ abstract class EventLog[A](id: String) extends Actor with EventLogSPI[A] with St
       sender() ! reply
       channel.foreach(_ ! reply)
       logFilterStatistics("source", events, updated)
+    case r @ ReplicationReadFailure(_, _) =>
+      sender() ! r
+      channel.foreach(_ ! r)
     case w: Write =>
       processWrites(Seq(w))
     case WriteN(writes) =>
       processWrites(writes)
       sender() ! WriteNComplete
     case w: ReplicationWrite =>
-      processReplicationWrites(Seq(w.copy(initiator = sender())))
+      processReplicationWrites(Seq(w.copy(replyTo = sender())))
     case ReplicationWriteN(writes) =>
       processReplicationWrites(writes)
       sender() ! ReplicationWriteNComplete
@@ -414,11 +412,10 @@ abstract class EventLog[A](id: String) extends Actor with EventLogSPI[A] with St
       import context.dispatcher
       if (!physicalDeletionRunning) {
         // Becomes Long.MaxValue in case of an empty-set to indicate that all event are replicated as required
-        val replicatedSeqNr =
-          (deletionMetadata.remoteLogIds.map(remoteReplicationProgress.getOrElse(_, 0L)) + Long.MaxValue).min
-        physicalDeletionRunning = true
+        val replicatedSeqNr = (deletionMetadata.remoteLogIds.map(remoteReplicationProgress.getOrElse(_, 0L)) + Long.MaxValue).min
         val deleteTo = deletionMetadata.toSequenceNr min replicatedSeqNr
-        deleteAsync(deleteTo).onComplete {
+        physicalDeletionRunning = true
+        delete(deleteTo).onComplete {
           case Success(_)  => self ! PhysicalDeleteSuccess(deleteTo)
           case Failure(ex) => self ! PhysicalDeleteFailure(ex)
         }
@@ -428,26 +425,23 @@ abstract class EventLog[A](id: String) extends Actor with EventLogSPI[A] with St
       physicalDeletionRunning = false
       if (deletionMetadata.toSequenceNr > deletedTo)
         scheduler.scheduleOnce(settings.deletionRetryDelay, self, PhysicalDelete)
-    case PhysicalDeleteFailure(ex) =>
+    case PhysicalDeleteFailure(cause: PhysicalDeletionNotSupportedException) =>
+    case PhysicalDeleteFailure(cause) =>
       import services._
-      ex match {
-        case ex: PhysicalDeletionNotSupportedException =>
-        case ex =>
-          log.error(ex, "Physical deletion of events failed. Retry in {}", settings.deletionRetryDelay)
-          physicalDeletionRunning = false
-          scheduler.scheduleOnce(settings.deletionRetryDelay, self, PhysicalDelete)
-      }
-    case LoadSnapshot(emitterId, requestor, iid) =>
+      log.error(cause, "Physical deletion of events failed. Retry in {}", settings.deletionRetryDelay)
+      physicalDeletionRunning = false
+      scheduler.scheduleOnce(settings.deletionRetryDelay, self, PhysicalDelete)
+    case LoadSnapshot(emitterId, replyTo, iid) =>
       import services.readDispatcher
       snapshotStore.loadAsync(emitterId) onComplete {
-        case Success(s) => requestor ! LoadSnapshotSuccess(s, iid)
-        case Failure(e) => requestor ! LoadSnapshotFailure(e, iid)
+        case Success(s) => replyTo ! LoadSnapshotSuccess(s, iid)
+        case Failure(e) => replyTo ! LoadSnapshotFailure(e, iid)
       }
-    case SaveSnapshot(snapshot, initiator, requestor, iid) =>
+    case SaveSnapshot(snapshot, initiator, replyTo, iid) =>
       import context.dispatcher
       snapshotStore.saveAsync(snapshot) onComplete {
-        case Success(_) => requestor.tell(SaveSnapshotSuccess(snapshot.metadata, iid), initiator)
-        case Failure(e) => requestor.tell(SaveSnapshotFailure(snapshot.metadata, e, iid), initiator)
+        case Success(_) => replyTo.tell(SaveSnapshotSuccess(snapshot.metadata, iid), initiator)
+        case Failure(e) => replyTo.tell(SaveSnapshotFailure(snapshot.metadata, e, iid), initiator)
       }
     case DeleteSnapshots(lowerSequenceNr) =>
       import context.dispatcher
@@ -456,8 +450,8 @@ abstract class EventLog[A](id: String) extends Actor with EventLogSPI[A] with St
         case Success(_) => sdr ! DeleteSnapshotsSuccess
         case Failure(e) => sdr ! DeleteSnapshotsFailure(e)
       }
-    case Terminated(requestor) =>
-      registry = registry.unregisterSubscriber(requestor)
+    case Terminated(replyTo) =>
+      registry = registry.unregisterSubscriber(replyTo)
   }
 
   override def receive =
@@ -468,98 +462,83 @@ abstract class EventLog[A](id: String) extends Actor with EventLogSPI[A] with St
 
   private[eventuate] def adjustFromSequenceNr(seqNr: Long): Long = seqNr max (deletionMetadata.toSequenceNr + 1)
 
-  private def replayer(requestor: ActorRef, iterator: => Iterator[DurableEvent] with Closeable, fromSequenceNr: Long): ActorRef =
-    context.actorOf(Props(new ChunkedEventReplay(requestor, iterator)).withDispatcher(services.readDispatcher.id))
+  private def replayer(destination: ActorRef, iterator: => Iterator[DurableEvent] with Closeable, fromSequenceNr: Long): ActorRef =
+    context.actorOf(Props(new ChunkedEventReplay(destination, iterator)).withDispatcher(services.readDispatcher.id))
 
   private def processWrites(writes: Seq[Write]): Unit = {
-    val result = for {
-      (partition, clock1) <- Try(adjustSequenceNr(writes.map(_.size).sum, settings.partitionSizeMax, clock))
-      (updatedWrites, clock2) = prepareWrites(id, writes, currentSystemTime, clock1)
-      updatedEvents = updatedWrites.flatMap(_.events)
-      _ <- Try(write(updatedEvents, partition, clock2))
-    } yield (updatedWrites, updatedEvents, clock2)
-
-    result match {
+    writeBatches(writes, prepareEvents(_, _, currentSystemTime)) match {
       case Success((updatedWrites, updatedEvents, clock2)) =>
         clock = clock2
-        updatedWrites.foreach(w => registry.pushWriteSuccess(w.events, w.initiator, w.requestor, w.instanceId))
+        updatedWrites.foreach { w =>
+          w.replyTo.tell(WriteSuccess(w.events, w.correlationId, w.instanceId), w.initiator)
+          registry.notifySubscribers(w.events, _ != w.replyTo)
+        }
         channel.foreach(_ ! Updated(updatedEvents))
       case Failure(e) =>
-        writes.foreach(w => registry.pushWriteFailure(w.events, w.initiator, w.requestor, w.instanceId, e))
+        writes.foreach(w => w.replyTo.tell(WriteFailure(w.events, e, w.correlationId, w.instanceId), w.initiator))
     }
   }
 
   private def processReplicationWrites(writes: Seq[ReplicationWrite]): Unit = {
-    writes.foreach { write =>
-      replicaVersionVectors = replicaVersionVectors.updated(write.sourceLogId, write.currentSourceVersionVector)
-    }
-    val result = for {
-      (partition, clock1) <- Try(adjustSequenceNr(writes.map(_.size).sum, settings.partitionSizeMax, clock))
-      (updatedWrites, clock2) = prepareReplicationWrites(id, writes, clock1)
-      updatedEvents = updatedWrites.flatMap(_.events)
-      _ <- Try(write(updatedEvents, partition, clock2))
-    } yield (updatedWrites, updatedEvents, clock2)
-
-    result match {
+    writes.foreach(w => replicaVersionVectors = replicaVersionVectors.updated(w.sourceLogId, w.currentSourceVersionVector))
+    writeBatches(writes, prepareReplicatedEvents) match {
       case Success((updatedWrites, updatedEvents, clock2)) =>
         clock = clock2
         updatedWrites.foreach { w =>
-          val rws = ReplicationWriteSuccess(w.size, w.sourceLogId, w.replicationProgress, clock2.versionVector)
-          val sdr = w.initiator
-          registry.pushReplicateSuccess(w.events)
+          val ws = ReplicationWriteSuccess(w.size, w.sourceLogId, w.replicationProgress, clock2.versionVector)
+          registry.notifySubscribers(w.events)
           channel.foreach(_ ! w)
           implicit val dispatcher = context.system.dispatchers.defaultGlobalDispatcher
           writeReplicationProgress(w.sourceLogId, w.replicationProgress) onComplete {
             case Success(_) =>
-              sdr ! rws
+              w.replyTo ! ws
             case Failure(e) =>
               // Write failure of replication progress can be ignored. Using a stale
               // progress to resume replication will redundantly read events from a
               // source log but these events will be successfully identified as
               // duplicates, either at source or latest at target.
               logger.warning(s"Writing of replication progress failed: ${e.getMessage}")
-              sdr ! ReplicationWriteFailure(e)
+              w.replyTo ! ReplicationWriteFailure(e)
           }
         }
         channel.foreach(_ ! Updated(updatedEvents))
       case Failure(e) =>
         writes.foreach { write =>
-          write.initiator ! ReplicationWriteFailure(e)
+          write.replyTo ! ReplicationWriteFailure(e)
         }
     }
   }
 
-  private def prepareWrites(logId: String, writes: Seq[Write], systemTimestamp: Long, clock: EventLogClock): (Seq[Write], EventLogClock) =
-    writes.foldLeft((Vector.empty[Write], clock)) {
-      case ((writes2, clock2), write) => prepareWrite(logId, write.events, systemTimestamp, clock2) match {
-        case (updated, clock3) => (writes2 :+ write.copy(events = updated), clock3)
+  private def writeBatches[B <: UpdateableEventBatch[B]](writes: Seq[B], prepare: (Seq[DurableEvent], EventLogClock) => (Seq[DurableEvent], EventLogClock)): Try[(Seq[B], Seq[DurableEvent], EventLogClock)] =
+    for {
+      (partition, clock1) <- Try(adjustSequenceNr(writes.map(_.size).sum, settings.partitionSize, clock))
+      (updatedWrites, clock2) = prepareBatches(writes, clock1, prepare)
+      updatedEvents = updatedWrites.flatMap(_.events)
+      _ <- Try(write(updatedEvents, partition, clock2))
+    } yield (updatedWrites, updatedEvents, clock2)
+
+  private def prepareBatches[B <: UpdateableEventBatch[B]](writes: Seq[B], clock: EventLogClock, prepare: (Seq[DurableEvent], EventLogClock) => (Seq[DurableEvent], EventLogClock)): (Seq[B], EventLogClock) =
+    writes.foldLeft((Vector.empty[B], clock)) {
+      case ((writes2, clock2), write) => prepare(write.events, clock2) match {
+        case (updated, clock3) => (writes2 :+ write.update(updated), clock3)
       }
     }
 
-  private def prepareReplicationWrites(logId: String, writes: Seq[ReplicationWrite], clock: EventLogClock): (Seq[ReplicationWrite], EventLogClock) = {
-    writes.foldLeft((Vector.empty[ReplicationWrite], clock)) {
-      case ((writes2, clock2), write) => prepareReplicationWrite(logId, write.events, write.replicationProgress, clock2) match {
-        case (updated, clock3) => (writes2 :+ write.copy(events = updated), clock3)
-      }
-    }
-  }
-
-  private def prepareWrite(logId: String, events: Seq[DurableEvent], systemTimestamp: Long, clock: EventLogClock): (Seq[DurableEvent], EventLogClock) = {
+  private def prepareEvents(events: Seq[DurableEvent], clock: EventLogClock, systemTimestamp: Long): (Seq[DurableEvent], EventLogClock) = {
     var snr = clock.sequenceNr
     var lvv = clock.versionVector
 
     val updated = events.map { e =>
       snr += 1L
 
-      val e2 = e.prepare(logId, snr, systemTimestamp)
+      val e2 = e.prepare(id, snr, systemTimestamp)
       lvv = lvv.merge(e2.vectorTimestamp)
       e2
     }
-
     (updated, clock.copy(sequenceNr = snr, versionVector = lvv))
   }
 
-  private def prepareReplicationWrite(logId: String, events: Seq[DurableEvent], replicationProgress: Long, clock: EventLogClock): (Seq[DurableEvent], EventLogClock) = {
+  private def prepareReplicatedEvents(events: Seq[DurableEvent], clock: EventLogClock): (Seq[DurableEvent], EventLogClock) = {
     var snr = clock.sequenceNr
     var lvv = clock.versionVector
 
@@ -573,7 +552,7 @@ abstract class EventLog[A](id: String) extends Actor with EventLogSPI[A] with St
       case (acc, e) =>
         snr += 1L
 
-        val e2 = e.prepare(logId, snr, e.systemTimestamp)
+        val e2 = e.prepare(id, snr, e.systemTimestamp)
         lvv = lvv.merge(e2.vectorTimestamp)
         acc :+ e2
     }
@@ -609,7 +588,6 @@ abstract class EventLog[A](id: String) extends Actor with EventLogSPI[A] with St
 }
 
 object EventLog {
-
   /**
    * State that is recovered from storage at startup
    */

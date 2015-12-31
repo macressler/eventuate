@@ -25,27 +25,27 @@ import com.rbmhtechnology.eventuate.EventsourcingProtocol._
 
 import scala.util._
 
-private class ChunkedEventReplay(requestor: ActorRef, iterator: => Iterator[DurableEvent] with Closeable) extends Actor {
+private class ChunkedEventReplay(destination: ActorRef, iterator: => Iterator[DurableEvent] with Closeable) extends Actor {
   val iter = iterator
 
   def receive = {
     case ReplayNext(max, iid) =>
-      Try(iter.take(max).foreach(event => requestor ! Replaying(event, iid))) match {
+      Try(iter.take(max).foreach(event => destination ! Replaying(event, iid))) match {
         case Success(_) if iter.hasNext =>
-          requestor ! ReplaySuspended(iid)
+          destination ! ReplaySuspended(iid)
         case Success(_) =>
-          requestor ! ReplaySuccess(iid)
+          destination ! ReplaySuccess(iid)
           context.stop(self)
         case Failure(e) =>
-          requestor ! ReplayFailure(e, iid)
+          destination ! ReplayFailure(e, iid)
           context.stop(self)
       }
-    case Terminated(r) if r == requestor =>
+    case Terminated(r) if r == destination =>
       context.stop(self)
   }
 
   override def preStart(): Unit = {
-    context.watch(requestor)
+    context.watch(destination)
   }
 
   override def postStop(): Unit = {

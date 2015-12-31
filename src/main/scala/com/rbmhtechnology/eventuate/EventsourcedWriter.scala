@@ -65,7 +65,7 @@ object EventsourcedWriter {
  *    prepared write batch so that further events can be processed while the asynchronous write operation is
  *    in progress.
  *  - Event processing during replay (either starting from a default or application-defined position) is subject
- *    to backpressure. After a configurable number of events (see `eventuate.replay.chunk-size-max` configuration
+ *    to backpressure. After a configurable number of events (see `eventuate.log.replay-batch-size` configuration
  *    parameter), replay is suspended until these events have been written to the target database and then resumed
  *    again. There's no backpressure mechanism for live event processing yet (but will come in future releases).
  *
@@ -98,7 +98,7 @@ trait EventsourcedWriter[R, W] extends EventsourcedView {
    * Asynchronously writes an incremental update to the target database. Incremental updates are prepared
    * during event processing by a concrete `onEvent` handler.
    *
-   * During event replay, this method is called latest after having replayed `eventuate.replay.chunk-size-max`
+   * During event replay, this method is called latest after having replayed `eventuate.log.replay-batch-size`
    * events and immediately after replay completes. During live processing, `write` is called immediately if
    * no write operation is in progress and an event has been handled by `onEvent`. If a write operation is in
    * progress, further event handling may run concurrently to that operation. If events are handled while a
@@ -176,8 +176,8 @@ trait EventsourcedWriter[R, W] extends EventsourcedView {
     case ReplaySuccess(iid) => if (iid == instanceId) {
       context.become(initiatedWrite orElse initiated)
       conditionChanged(currentVectorTime)
-      messageStash.unstashAll()
       recovered()
+      unstashAll()
       write(instanceId)
     }
     case other =>
@@ -201,7 +201,7 @@ trait EventsourcedWriter[R, W] extends EventsourcedView {
     case WriteSuccess(r, iid) => if (iid == instanceId) {
       writeSuccess(r)
       context.become(initiating)
-      replayer ! ReplayNext(replayChunkSizeMax, iid)
+      replayer ! ReplayNext(replayBatchSize, iid)
     }
     case WriteFailure(cause, iid) => if (iid == instanceId) {
       writeFailure(cause)
