@@ -62,7 +62,10 @@ object EventsourcedActorSpec {
       case Cmd(p, num) => 1 to num foreach { i =>
         persist(s"${p}-${i}") {
           case Success(evt) =>
-          case Failure(err) => cmdProbe ! ((err, lastVectorTimestamp, currentVectorTime, lastSequenceNr))
+          case Failure(err: AskTimeoutException) =>
+            sender() ! "timeout"
+          case Failure(err) =>
+            cmdProbe ! ((err, lastVectorTimestamp, currentVectorTime, lastSequenceNr))
         }
       }
     }
@@ -234,8 +237,8 @@ class EventsourcedActorSpec extends TestKit(ActorSystem("test", EventsourcedActo
     processRecover(system.actorOf(Props(new TestStashingActor(logProbe.ref, probe, stateSync))))
 
   def processRecover(actor: ActorRef): ActorRef = {
-    logProbe.expectMsg(LoadSnapshot(emitterIdA, actor, instanceId))
-    actor ! LoadSnapshotSuccess(None, instanceId)
+    logProbe.expectMsg(LoadSnapshot(emitterIdA, instanceId))
+    logProbe.sender() ! LoadSnapshotSuccess(None, instanceId)
     logProbe.expectMsg(Replay(1, actor, instanceId))
     actor ! ReplaySuccess(instanceId)
     actor
@@ -272,8 +275,8 @@ class EventsourcedActorSpec extends TestKit(ActorSystem("test", EventsourcedActo
         val write1 = logProbe.expectMsgClass(classOf[Write])
         logProbe.sender() ! WriteSuccess(Seq(event("boom", 1L), event("a-2", 2L)), write1.correlationId, instanceId)
 
-        logProbe.expectMsg(LoadSnapshot(emitterIdA, actor, instanceId + 1))
-        actor ! LoadSnapshotSuccess(None, instanceId + 1)
+        logProbe.expectMsg(LoadSnapshot(emitterIdA, instanceId + 1))
+        logProbe.sender() ! LoadSnapshotSuccess(None, instanceId + 1)
         logProbe.expectMsg(Replay(1, actor, instanceId + 1))
         actor ! Replaying(event("a-1", 1L), instanceId + 1)
         actor ! Replaying(event("a-2", 2L), instanceId + 1)
@@ -476,8 +479,8 @@ class EventsourcedActorSpec extends TestKit(ActorSystem("test", EventsourcedActo
         processWrite(1)
         probe.expectMsg("a")
 
-        logProbe.expectMsg(LoadSnapshot(emitterIdA, actor, instanceId + 1))
-        actor ! LoadSnapshotSuccess(None, instanceId + 1)
+        logProbe.expectMsg(LoadSnapshot(emitterIdA, instanceId + 1))
+        logProbe.sender() ! LoadSnapshotSuccess(None, instanceId + 1)
         logProbe.expectMsg(Replay(1, actor, instanceId + 1))
         actor ! Replaying(event("a", 1), instanceId + 1)
         actor ! ReplaySuccess(instanceId + 1)
@@ -510,8 +513,8 @@ class EventsourcedActorSpec extends TestKit(ActorSystem("test", EventsourcedActo
         val write1 = logProbe.expectMsgClass(classOf[Write])
         logProbe.sender() ! WriteSuccess(Seq(event("boom", 1L), event("a-2", 2L)), write1.correlationId, instanceId)
 
-        logProbe.expectMsg(LoadSnapshot(emitterIdA, actor, instanceId + 1))
-        actor ! LoadSnapshotSuccess(None, instanceId + 1)
+        logProbe.expectMsg(LoadSnapshot(emitterIdA, instanceId + 1))
+        logProbe.sender() ! LoadSnapshotSuccess(None, instanceId + 1)
         logProbe.expectMsg(Replay(1, actor, instanceId + 1))
         actor ! Replaying(event("a-1", 1L), instanceId + 1)
         actor ! Replaying(event("a-2", 2L), instanceId + 1)
@@ -663,8 +666,8 @@ class EventsourcedActorSpec extends TestKit(ActorSystem("test", EventsourcedActo
 
         processWrite(1) // ignored
 
-        logProbe.expectMsg(LoadSnapshot(emitterIdA, actor, instanceId + 1))
-        actor ! LoadSnapshotSuccess(None, instanceId + 1)
+        logProbe.expectMsg(LoadSnapshot(emitterIdA, instanceId + 1))
+        logProbe.sender() ! LoadSnapshotSuccess(None, instanceId + 1)
         logProbe.expectMsg(Replay(1, actor, instanceId + 1))
         actor ! Replaying(event("a", 1), instanceId + 1)
         actor ! ReplaySuccess(instanceId + 1)
@@ -771,18 +774,12 @@ class EventsourcedActorSpec extends TestKit(ActorSystem("test", EventsourcedActo
       }
       "report write timeouts to persist handler and ignore later replies from event log" in {
         val actor = recoveredEventsourcedActor(stateSync = true)
-        actor ! Cmd("a", 1)
+        actor.tell(Cmd("a", 1), cmdProbe.ref)
 
         val write = logProbe.expectMsgClass(classOf[Write])
         val event = write.events(0)
 
-        cmdProbe.expectMsgPF() {
-          case (cause: AskTimeoutException, currentVectorTime, lastVectorTimestamp, lastSequenceNr) =>
-            currentVectorTime should be(event.vectorTimestamp)
-            lastVectorTimestamp should be(event.vectorTimestamp)
-            lastSequenceNr should be(event.localSequenceNr)
-        }
-
+        cmdProbe.expectMsg("timeout")
         logProbe.sender() ! WriteSuccess(Seq(event), write.correlationId, instanceId)
         cmdProbe.expectNoMsg(timeout)
       }
@@ -853,8 +850,8 @@ class EventsourcedActorSpec extends TestKit(ActorSystem("test", EventsourcedActo
       val actor = unrecoveredSnapshotActor()
       val snapshot = Snapshot(State(Vector("a", "b")), emitterIdA, event("b", 2), timestamp(2, 4))
 
-      logProbe.expectMsg(LoadSnapshot(emitterIdA, actor, instanceId))
-      actor ! LoadSnapshotSuccess(Some(snapshot), instanceId)
+      logProbe.expectMsg(LoadSnapshot(emitterIdA, instanceId))
+      logProbe.sender() ! LoadSnapshotSuccess(Some(snapshot), instanceId)
       logProbe.expectMsg(Replay(3, actor, instanceId))
       actor ! ReplaySuccess(instanceId)
       evtProbe.expectMsg((Vector("a", "b"), timestamp(2), timestamp(2, 4), 2))
@@ -863,8 +860,8 @@ class EventsourcedActorSpec extends TestKit(ActorSystem("test", EventsourcedActo
       val actor = unrecoveredSnapshotActor()
       val snapshot = Snapshot(State(Vector("a", "b")), emitterIdA, event("b", 2), timestamp(2, 4))
 
-      logProbe.expectMsg(LoadSnapshot(emitterIdA, actor, instanceId))
-      actor ! LoadSnapshotSuccess(Some(snapshot), instanceId)
+      logProbe.expectMsg(LoadSnapshot(emitterIdA, instanceId))
+      logProbe.sender() ! LoadSnapshotSuccess(Some(snapshot), instanceId)
       logProbe.expectMsg(Replay(3, actor, instanceId))
       actor ! Replaying(event("c", 3), instanceId)
       actor ! Replaying(event("d", 4), instanceId)
@@ -880,8 +877,8 @@ class EventsourcedActorSpec extends TestKit(ActorSystem("test", EventsourcedActo
         DeliveryAttempt("4", "y", cmdProbe.ref.path))
       val snapshot = Snapshot(State(Vector("a", "b")), emitterIdA, event("b", 2), timestamp(2, 4), deliveryAttempts = unconfirmed)
 
-      logProbe.expectMsg(LoadSnapshot(emitterIdA, actor, instanceId))
-      actor ! LoadSnapshotSuccess(Some(snapshot), instanceId)
+      logProbe.expectMsg(LoadSnapshot(emitterIdA, instanceId))
+      logProbe.sender() ! LoadSnapshotSuccess(Some(snapshot), instanceId)
       logProbe.expectMsg(Replay(3, actor, instanceId))
       actor ! ReplaySuccess(instanceId)
       evtProbe.expectMsg((Vector("a", "b"), timestamp(2), timestamp(2, 4), 2))
@@ -892,8 +889,8 @@ class EventsourcedActorSpec extends TestKit(ActorSystem("test", EventsourcedActo
       val actor = unrecoveredSnapshotActor()
       val snapshot = Snapshot("foo", emitterIdA, event("b", 2), timestamp(2, 4))
 
-      logProbe.expectMsg(LoadSnapshot(emitterIdA, actor, instanceId))
-      actor ! LoadSnapshotSuccess(Some(snapshot), instanceId)
+      logProbe.expectMsg(LoadSnapshot(emitterIdA, instanceId))
+      logProbe.sender() ! LoadSnapshotSuccess(Some(snapshot), instanceId)
       logProbe.expectMsg(Replay(1, actor, instanceId))
       actor ! Replaying(event("a", 1), instanceId)
       actor ! Replaying(event("b", 2), instanceId)
@@ -923,8 +920,8 @@ class EventsourcedActorSpec extends TestKit(ActorSystem("test", EventsourcedActo
       actor ! "snap"
 
       val snapshot = Snapshot(State(Vector("x", "a", "b")), emitterIdA, event3, timestamp(3, 1))
-      logProbe.expectMsg(SaveSnapshot(snapshot, system.deadLetters, actor, instanceId))
-      actor ! SaveSnapshotSuccess(snapshot.metadata, instanceId)
+      logProbe.expectMsg(SaveSnapshot(snapshot, system.deadLetters, instanceId))
+      logProbe.sender() ! SaveSnapshotSuccess(snapshot.metadata, instanceId)
       cmdProbe.expectMsg(snapshot.metadata)
     }
     "save a snapshot with unconfirmed messages" in {
@@ -957,8 +954,8 @@ class EventsourcedActorSpec extends TestKit(ActorSystem("test", EventsourcedActo
         DeliveryAttempt("4", ("y", timestamp(4), timestamp(4), 4), cmdProbe.ref.path))
       val snapshot = Snapshot(State(Vector("a", "b")), emitterIdA, event(DeliverRequested("y"), 4), timestamp(4), deliveryAttempts = unconfirmed)
 
-      logProbe.expectMsg(SaveSnapshot(snapshot, system.deadLetters, actor, instanceId))
-      actor ! SaveSnapshotSuccess(snapshot.metadata, instanceId)
+      logProbe.expectMsg(SaveSnapshot(snapshot, system.deadLetters, instanceId))
+      logProbe.sender() ! SaveSnapshotSuccess(snapshot.metadata, instanceId)
       cmdProbe.expectMsg(snapshot.metadata)
     }
     "not save the same snapshot concurrently" in {
@@ -983,8 +980,8 @@ class EventsourcedActorSpec extends TestKit(ActorSystem("test", EventsourcedActo
         val e1 = event1a.copy(vectorTimestamp = timestamp(1, 0), processId = emitterIdA)
         val e2 = event1b.copy(vectorTimestamp = timestamp(2, 0), processId = emitterIdA)
 
-        logProbe.expectMsg(LoadSnapshot(emitterIdA, actor, instanceId))
-        actor ! LoadSnapshotSuccess(None, instanceId)
+        logProbe.expectMsg(LoadSnapshot(emitterIdA, instanceId))
+        logProbe.sender() ! LoadSnapshotSuccess(None, instanceId)
         logProbe.expectMsg(Replay(1, actor, instanceId))
 
         actor ! Replaying(e1, instanceId)
@@ -1002,8 +999,8 @@ class EventsourcedActorSpec extends TestKit(ActorSystem("test", EventsourcedActo
         val e3 = event2c.copy(vectorTimestamp = timestamp(0, 2), processId = emitterIdB, localSequenceNr = 8L)
         val e4 = event2d.copy(vectorTimestamp = timestamp(0, 3), processId = emitterIdB, localSequenceNr = 9L)
 
-        logProbe.expectMsg(LoadSnapshot(emitterIdA, actor, instanceId))
-        actor ! LoadSnapshotSuccess(None, instanceId)
+        logProbe.expectMsg(LoadSnapshot(emitterIdA, instanceId))
+        logProbe.sender() ! LoadSnapshotSuccess(None, instanceId)
         logProbe.expectMsg(Replay(1, actor, instanceId))
 
         actor ! Replaying(e1, instanceId)

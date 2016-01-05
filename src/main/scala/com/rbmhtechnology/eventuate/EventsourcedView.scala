@@ -16,19 +16,33 @@
 
 package com.rbmhtechnology.eventuate
 
+import java.util.concurrent.TimeUnit
 import java.util.function.BiConsumer
 import java.util.{ Optional => JOption }
 import java.util.concurrent.atomic.AtomicInteger
 
 import akka.actor._
+import akka.pattern.{ ask, pipe }
+import akka.util.Timeout
 
 import com.rbmhtechnology.eventuate.EventsourcingProtocol._
 import com.typesafe.config.Config
 
+import scala.concurrent.duration._
 import scala.util._
 
 private class EventsourcedViewSettings(config: Config) {
-  val replayBatchSize = config.getInt("eventuate.log.replay-batch-size")
+  val replayBatchSize =
+    config.getInt("eventuate.log.replay-batch-size")
+
+  val readTimeout =
+    config.getDuration("eventuate.log.read-timeout", TimeUnit.MILLISECONDS).millis
+
+  val loadTimeout =
+    config.getDuration("eventuate.snapshot.load-timeout", TimeUnit.MILLISECONDS).millis
+
+  val saveTimeout =
+    config.getDuration("eventuate.snapshot.save-timeout", TimeUnit.MILLISECONDS).millis
 }
 
 object EventsourcedView {
@@ -73,6 +87,7 @@ object EventsourcedView {
  */
 trait EventsourcedView extends Actor with Stash with ActorLogging {
   import EventsourcedView._
+  import context.dispatcher
 
   type Handler[A] = EventsourcedView.Handler[A]
 
@@ -257,6 +272,8 @@ trait EventsourcedView extends Actor with Stash with ActorLogging {
    * sender with `sender()`.
    */
   final def save(snapshot: Any)(handler: Handler[SnapshotMetadata]): Unit = {
+    implicit val timeout = Timeout(settings.saveTimeout)
+
     val payload = snapshot match {
       case tree: ConcurrentVersionsTree[_, _] => tree.copy()
       case other                              => other
@@ -264,13 +281,16 @@ trait EventsourcedView extends Actor with Stash with ActorLogging {
 
     val prototype = Snapshot(payload, id, lastHandledEvent, currentVectorTime)
     val metadata = prototype.metadata
+    val iid = instanceId
 
     if (saveRequests.contains(metadata)) {
       handler(Failure(new IllegalStateException(s"snapshot with metadata ${metadata} is currently being saved")))
     } else {
       saveRequests += (metadata -> handler)
       val snapshot = snapshotCaptured(prototype)
-      eventLog ! SaveSnapshot(snapshot, sender(), self, instanceId)
+      eventLog.ask(SaveSnapshot(snapshot, sender(), iid)).recover {
+        case t => SaveSnapshotFailure(metadata, t, iid)
+      }.pipeTo(self)(sender())
     }
   }
 
@@ -301,8 +321,14 @@ trait EventsourcedView extends Actor with Stash with ActorLogging {
   /**
    * Internal API.
    */
-  private[eventuate] def load(): Unit =
-    eventLog ! LoadSnapshot(id, self, instanceId)
+  private[eventuate] def load(): Unit = {
+    implicit val timeout = Timeout(settings.loadTimeout)
+    val iid = instanceId
+
+    eventLog ? LoadSnapshot(id, iid) recover {
+      case t => LoadSnapshotFailure(t, iid)
+    } pipeTo self
+  }
 
   /**
    * Internal API.

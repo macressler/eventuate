@@ -132,8 +132,8 @@ class EventsourcedViewSpec extends TestKit(ActorSystem("test")) with WordSpecLik
     processRecover(system.actorOf(Props(new TestStashingView(logProbe.ref, msgProbe.ref))))
 
   def processRecover(actor: ActorRef, instanceId: Int = instanceId): ActorRef = {
-    logProbe.expectMsg(LoadSnapshot(emitterIdA, actor, instanceId))
-    actor ! LoadSnapshotSuccess(None, instanceId)
+    logProbe.expectMsg(LoadSnapshot(emitterIdA, instanceId))
+    logProbe.sender() ! LoadSnapshotSuccess(None, instanceId)
     logProbe.expectMsg(Replay(1, actor, instanceId))
     actor ! ReplaySuccess(instanceId)
     actor
@@ -143,8 +143,8 @@ class EventsourcedViewSpec extends TestKit(ActorSystem("test")) with WordSpecLik
     "recover from replayed events" in {
       val actor = unrecoveredEventsourcedView()
 
-      logProbe.expectMsg(LoadSnapshot(emitterIdA, actor, instanceId))
-      actor ! LoadSnapshotSuccess(None, instanceId)
+      logProbe.expectMsg(LoadSnapshot(emitterIdA, instanceId))
+      logProbe.sender() ! LoadSnapshotSuccess(None, instanceId)
       logProbe.expectMsg(Replay(1, actor, instanceId))
 
       actor ! Replaying(event1a, instanceId)
@@ -157,8 +157,8 @@ class EventsourcedViewSpec extends TestKit(ActorSystem("test")) with WordSpecLik
     "recover from events that are replayed in batches" in {
       val actor = unrecoveredEventsourcedView(2)
 
-      logProbe.expectMsg(LoadSnapshot(emitterIdA, actor, instanceId))
-      actor ! LoadSnapshotSuccess(None, instanceId)
+      logProbe.expectMsg(LoadSnapshot(emitterIdA, instanceId))
+      logProbe.sender() ! LoadSnapshotSuccess(None, instanceId)
       logProbe.expectMsg(Replay(1, 2, actor, instanceId))
 
       actor ! Replaying(event1a, instanceId)
@@ -177,8 +177,8 @@ class EventsourcedViewSpec extends TestKit(ActorSystem("test")) with WordSpecLik
     "retry recovery on failure" in {
       val actor = unrecoveredEventsourcedView()
 
-      logProbe.expectMsg(LoadSnapshot(emitterIdA, actor, instanceId))
-      actor ! LoadSnapshotSuccess(None, instanceId)
+      logProbe.expectMsg(LoadSnapshot(emitterIdA, instanceId))
+      logProbe.sender() ! LoadSnapshotSuccess(None, instanceId)
       logProbe.expectMsg(Replay(1, actor, instanceId))
 
       actor ! Replaying(event1a, instanceId)
@@ -186,8 +186,8 @@ class EventsourcedViewSpec extends TestKit(ActorSystem("test")) with WordSpecLik
       actor ! Replaying(event1c, instanceId)
       actor ! ReplaySuccess(instanceId)
 
-      logProbe.expectMsg(LoadSnapshot(emitterIdA, actor, instanceId + 1))
-      actor ! LoadSnapshotSuccess(None, instanceId + 1)
+      logProbe.expectMsg(LoadSnapshot(emitterIdA, instanceId + 1))
+      logProbe.sender() ! LoadSnapshotSuccess(None, instanceId + 1)
       logProbe.expectMsg(Replay(1, actor, instanceId + 1))
 
       actor ! Replaying(event1a, instanceId + 1)
@@ -219,8 +219,8 @@ class EventsourcedViewSpec extends TestKit(ActorSystem("test")) with WordSpecLik
     "stash commands during recovery and handle them after retried recovery" in {
       val actor = unrecoveredEventsourcedView()
 
-      logProbe.expectMsg(LoadSnapshot(emitterIdA, actor, instanceId))
-      actor ! LoadSnapshotSuccess(None, instanceId)
+      logProbe.expectMsg(LoadSnapshot(emitterIdA, instanceId))
+      logProbe.sender() ! LoadSnapshotSuccess(None, instanceId)
       logProbe.expectMsg(Replay(1, actor, instanceId))
 
       actor ! Replaying(event1a, instanceId)
@@ -230,8 +230,8 @@ class EventsourcedViewSpec extends TestKit(ActorSystem("test")) with WordSpecLik
       actor ! Replaying(event1c, instanceId)
       actor ! ReplaySuccess(instanceId)
 
-      logProbe.expectMsg(LoadSnapshot(emitterIdA, actor, instanceId + 1))
-      actor ! LoadSnapshotSuccess(None, instanceId + 1)
+      logProbe.expectMsg(LoadSnapshot(emitterIdA, instanceId + 1))
+      logProbe.sender() ! LoadSnapshotSuccess(None, instanceId + 1)
       logProbe.expectMsg(Replay(1, actor, instanceId + 1))
 
       actor ! Replaying(event1a, instanceId + 1)
@@ -262,8 +262,8 @@ class EventsourcedViewSpec extends TestKit(ActorSystem("test")) with WordSpecLik
       val actor = unrecoveredEventsourcedView()
       val next = instanceId + 1
 
-      logProbe.expectMsg(LoadSnapshot(emitterIdA, actor, instanceId))
-      actor ! LoadSnapshotSuccess(None, instanceId)
+      logProbe.expectMsg(LoadSnapshot(emitterIdA, instanceId))
+      logProbe.sender() ! LoadSnapshotSuccess(None, instanceId)
       logProbe.expectMsg(Replay(1, actor, instanceId))
 
       actor ! Replaying(event2a, instanceId)
@@ -275,8 +275,8 @@ class EventsourcedViewSpec extends TestKit(ActorSystem("test")) with WordSpecLik
       msgProbe.expectMsg(("a", event2a.vectorTimestamp, event2a.localSequenceNr))
       msgProbe.expectMsg(("b", event2b.vectorTimestamp, event2b.localSequenceNr))
 
-      logProbe.expectMsg(LoadSnapshot(emitterIdA, actor, next))
-      actor ! LoadSnapshotSuccess(None, next)
+      logProbe.expectMsg(LoadSnapshot(emitterIdA, next))
+      logProbe.sender() ! LoadSnapshotSuccess(None, next)
       logProbe.expectMsg(Replay(1, actor, next))
 
       actor ! Replaying(event2a, next)

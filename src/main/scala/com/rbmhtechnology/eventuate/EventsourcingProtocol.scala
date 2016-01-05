@@ -127,7 +127,7 @@ object EventsourcingProtocol {
   /**
    * Instructs an event log to save the given `snapshot`.
    */
-  case class SaveSnapshot(snapshot: Snapshot, initiator: ActorRef, replyTo: ActorRef, instanceId: Int)
+  case class SaveSnapshot(snapshot: Snapshot, initiator: ActorRef, instanceId: Int)
 
   /**
    * Success reply after a [[SaveSnapshot]].
@@ -142,7 +142,7 @@ object EventsourcingProtocol {
   /**
    * Instructs an event log to load the most recent snapshot for `emitterId`.
    */
-  case class LoadSnapshot(emitterId: String, replyTo: ActorRef, instanceId: Int)
+  case class LoadSnapshot(emitterId: String, instanceId: Int)
 
   /**
    * Success reply after a [[LoadSnapshot]].

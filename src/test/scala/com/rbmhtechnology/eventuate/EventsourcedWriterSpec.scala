@@ -112,8 +112,8 @@ class EventsourcedWriterSpec extends TestKit(ActorSystem("test")) with WordSpecL
   }
 
   def processLoad(actor: ActorRef, instanceId: Int = instanceId): Unit = {
-    logProbe.expectMsg(LoadSnapshot(emitterIdB, actor, instanceId))
-    actor ! LoadSnapshotSuccess(None, instanceId)
+    logProbe.expectMsg(LoadSnapshot(emitterIdB, instanceId))
+    logProbe.sender() ! LoadSnapshotSuccess(None, instanceId)
   }
 
   def processReplay(actor: ActorRef, fromSequenceNr: Long): Unit = {

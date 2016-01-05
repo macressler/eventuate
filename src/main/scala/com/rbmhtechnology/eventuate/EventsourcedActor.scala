@@ -48,7 +48,6 @@ private class EventsourcedActorSettings(config: Config) {
  */
 trait EventsourcedActor extends EventsourcedView with EventsourcedClock {
   import EventsourcingProtocol._
-  import context.dispatcher
 
   private val settings =
     new EventsourcedActorSettings(context.system.settings.config)
@@ -188,7 +187,7 @@ trait EventsourcedActor extends EventsourcedView with EventsourcedClock {
     // would need to be sent to self (after the ask future completes) which could
     // re-order them relative to directly received Written messages.
     eventLog ! Write(writeRequests, sender(), self, correlationId, instanceId)
-    scheduleWriteRequestTimeout(correlationId)
+    scheduleWriteRequestTimeout(correlationId, sender())
     writeRequests = Vector.empty
   }
 
@@ -197,9 +196,9 @@ trait EventsourcedActor extends EventsourcedView with EventsourcedClock {
     writeRequestCorrelationId
   }
 
-  private def scheduleWriteRequestTimeout(correlationId: Int): Unit = {
-    val schedule = context.system.scheduler.scheduleOnce(settings.writeTimeout, self,
-      WriteFailure(writeRequests, writeRequestTimeoutException, correlationId, instanceId))
+  private def scheduleWriteRequestTimeout(correlationId: Int, sender: ActorRef): Unit = {
+    val reply = WriteFailure(writeRequests, writeRequestTimeoutException, correlationId, instanceId)
+    val schedule = context.system.scheduler.scheduleOnce(settings.writeTimeout, self, reply)(context.dispatcher, sender)
     writeRequestTimeoutSchedules = writeRequestTimeoutSchedules.updated(correlationId, schedule)
   }
 

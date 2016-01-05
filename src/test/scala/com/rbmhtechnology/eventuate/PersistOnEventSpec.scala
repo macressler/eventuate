@@ -112,8 +112,8 @@ class PersistOnEventSpec extends TestKit(ActorSystem("test")) with WordSpecLike 
     processRecover(unrecoveredTestActor(stateSync))
 
   def processRecover(actor: ActorRef, instanceId: Int = instanceId, events: Seq[DurableEvent] = Seq()): ActorRef = {
-    logProbe.expectMsg(LoadSnapshot(emitterIdA, actor, instanceId))
-    actor ! LoadSnapshotSuccess(None, instanceId)
+    logProbe.expectMsg(LoadSnapshot(emitterIdA, instanceId))
+    logProbe.sender() ! LoadSnapshotSuccess(None, instanceId)
     logProbe.expectMsg(Replay(1, actor, instanceId))
     events.foreach(event => actor ! Replaying(event, instanceId))
     actor ! ReplaySuccess(instanceId)

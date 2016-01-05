@@ -431,17 +431,19 @@ abstract class EventLog[A](id: String) extends Actor with EventLogSPI[A] with St
       log.error(cause, "Physical deletion of events failed. Retry in {}", settings.deletionRetryDelay)
       physicalDeletionRunning = false
       scheduler.scheduleOnce(settings.deletionRetryDelay, self, PhysicalDelete)
-    case LoadSnapshot(emitterId, replyTo, iid) =>
+    case LoadSnapshot(emitterId, iid) =>
       import services.readDispatcher
+      val sdr = sender()
       snapshotStore.loadAsync(emitterId) onComplete {
-        case Success(s) => replyTo ! LoadSnapshotSuccess(s, iid)
-        case Failure(e) => replyTo ! LoadSnapshotFailure(e, iid)
+        case Success(s) => sdr ! LoadSnapshotSuccess(s, iid)
+        case Failure(e) => sdr ! LoadSnapshotFailure(e, iid)
       }
-    case SaveSnapshot(snapshot, initiator, replyTo, iid) =>
+    case SaveSnapshot(snapshot, initiator, iid) =>
       import context.dispatcher
+      val sdr = sender()
       snapshotStore.saveAsync(snapshot) onComplete {
-        case Success(_) => replyTo.tell(SaveSnapshotSuccess(snapshot.metadata, iid), initiator)
-        case Failure(e) => replyTo.tell(SaveSnapshotFailure(snapshot.metadata, e, iid), initiator)
+        case Success(_) => sdr.tell(SaveSnapshotSuccess(snapshot.metadata, iid), initiator)
+        case Failure(e) => sdr.tell(SaveSnapshotFailure(snapshot.metadata, e, iid), initiator)
       }
     case DeleteSnapshots(lowerSequenceNr) =>
       import context.dispatcher

@@ -113,8 +113,8 @@ class EventsourcedProcessorSpec extends TestKit(ActorSystem("test")) with WordSp
   }
 
   def processLoad(actor: ActorRef, instanceId: Int = instanceId): Unit = {
-    srcProbe.expectMsg(LoadSnapshot(emitterIdB, actor, instanceId))
-    actor ! LoadSnapshotSuccess(None, instanceId)
+    srcProbe.expectMsg(LoadSnapshot(emitterIdB, instanceId))
+    srcProbe.sender() ! LoadSnapshotSuccess(None, instanceId)
   }
 
   def processReplay(actor: ActorRef, fromSequenceNr: Long, instanceId: Int = instanceId): Unit =
