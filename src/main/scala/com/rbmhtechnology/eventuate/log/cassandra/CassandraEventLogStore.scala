@@ -34,7 +34,7 @@ private[eventuate] class CassandraEventLogStore(cassandra: Cassandra, logId: Str
   val preparedReadEventsStatement: PreparedStatement =
     cassandra.prepareReadEvents(logId)
 
-  def writeSync(events: Seq[DurableEvent], partition: Long) =
+  def write(events: Seq[DurableEvent], partition: Long) =
     cassandra.executeBatch { batch =>
       events.foreach { event =>
         batch.add(preparedWriteEventStatement.bind(partition: JLong, event.localSequenceNr: JLong, cassandra.eventToByteBuffer(event)))

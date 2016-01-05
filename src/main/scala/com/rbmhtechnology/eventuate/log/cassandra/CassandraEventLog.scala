@@ -123,7 +123,7 @@ class CassandraEventLog(id: String) extends EventLog[CassandraEventIteratorParam
   }
 
   override def writeDeletionMetadata(deleteMetadata: DeletionMetadata) =
-    deletedToStore.writeDeletedToSync(deleteMetadata.toSequenceNr)(context.system.dispatchers.defaultGlobalDispatcher)
+    deletedToStore.writeDeletedTo(deleteMetadata.toSequenceNr)
 
   override def readDeletionMetadata = {
     import services.readDispatcher
@@ -131,7 +131,7 @@ class CassandraEventLog(id: String) extends EventLog[CassandraEventIteratorParam
   }
 
   override def write(events: Seq[DurableEvent], partition: Long, clock: EventLogClock): Unit = {
-    eventLogStore.writeSync(events, partition)
+    eventLogStore.write(events, partition)
     updateCount += events.size
     if (updateCount >= cassandra.settings.indexUpdateLimit) {
       index ! UpdateIndex(null, clock.sequenceNr)

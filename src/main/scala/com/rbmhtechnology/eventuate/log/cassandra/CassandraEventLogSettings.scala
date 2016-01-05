@@ -32,6 +32,12 @@ import scala.concurrent.duration._
 class CassandraEventLogSettings(config: Config) extends EventLogSettings {
   import CassandraEventLogSettings._
 
+  val writeTimeout: Long =
+    config.getDuration("eventuate.log.write-timeout", TimeUnit.MILLISECONDS)
+
+  val writeBatchSize: Int =
+    config.getInt("eventuate.log.write-batch-size")
+
   val keyspace: String =
     config.getString("eventuate.log.cassandra.keyspace")
 
@@ -55,9 +61,6 @@ class CassandraEventLogSettings(config: Config) extends EventLogSettings {
 
   val contactPoints =
     getContactPoints(config.getStringList("eventuate.log.cassandra.contact-points").asScala, defaultPort)
-
-  val writeBatchSize: Int =
-    config.getInt("eventuate.log.write-batch-size")
 
   val partitionSize: Long =
     config.getLong("eventuate.log.cassandra.partition-size")
